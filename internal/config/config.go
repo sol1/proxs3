@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ const (
 	DefaultCacheMaxMB    = 4096
 	DefaultCredentialDir = "/etc/pve/priv/proxs3"
 	DefaultStorageCfg    = "/etc/pve/storage.cfg"
+	DefaultHeadroomGB    = 100
 )
 
 // StorageConfig represents a discovered S3 storage from storage.cfg.
@@ -50,6 +52,7 @@ type DaemonConfig struct {
 	CacheMaxMB    int64       `json:"cache_max_mb"`
 	CredentialDir string      `json:"credential_dir"`
 	StorageCfg    string      `json:"storage_cfg"`
+	HeadroomGB    int64       `json:"headroom_gb"`
 	Proxy         ProxyConfig `json:"proxy"`
 
 	// Populated at load time from storage.cfg + credential files
@@ -63,6 +66,7 @@ func DefaultDaemonConfig() *DaemonConfig {
 		CacheMaxMB:    DefaultCacheMaxMB,
 		CredentialDir: DefaultCredentialDir,
 		StorageCfg:    DefaultStorageCfg,
+		HeadroomGB:    DefaultHeadroomGB,
 	}
 }
 
@@ -96,7 +100,9 @@ func (cfg *DaemonConfig) DiscoverStorages() error {
 	for i := range storages {
 		cred, err := LoadCredential(cfg.CredentialDir, storages[i].StorageID)
 		if err != nil {
-			return fmt.Errorf("loading credentials for %s: %w", storages[i].StorageID, err)
+			// Credentials are optional (public buckets) or may not exist yet
+			log.Printf("Note: no credentials for %s: %v", storages[i].StorageID, err)
+			continue
 		}
 		storages[i].AccessKey = cred.AccessKey
 		storages[i].SecretKey = cred.SecretKey
@@ -199,9 +205,6 @@ func LoadCredential(credentialDir, storageID string) (*Credential, error) {
 	var cred Credential
 	if err := json.Unmarshal(data, &cred); err != nil {
 		return nil, fmt.Errorf("parsing credential file %s: %w", path, err)
-	}
-	if cred.AccessKey == "" || cred.SecretKey == "" {
-		return nil, fmt.Errorf("credential file %s: access_key and secret_key are required", path)
 	}
 	return &cred, nil
 }

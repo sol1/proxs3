@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -10,6 +11,8 @@ import (
 	"github.com/sol1/proxs3/internal/api"
 	"github.com/sol1/proxs3/internal/config"
 )
+
+const pidFile = "/run/proxs3d.pid"
 
 func main() {
 	configPath := flag.String("config", "/etc/proxs3/proxs3d.json", "path to config file")
@@ -25,6 +28,12 @@ func main() {
 	for _, s := range cfg.Storages {
 		log.Printf("  storage: %s bucket=%s endpoint=%s", s.StorageID, s.Bucket, s.Endpoint)
 	}
+
+	// Write PID file so the Perl plugin can signal us directly
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
+		log.Printf("Warning: could not write PID file %s: %v", pidFile, err)
+	}
+	defer os.Remove(pidFile)
 
 	srv, err := api.New(cfg)
 	if err != nil {

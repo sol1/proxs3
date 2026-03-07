@@ -18,4 +18,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.12.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.18.7 // indirect
 	github.com/aws/smithy-go v1.22.1 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	golang.org/x/sys v0.13.0 // indirect
 )

@@ -7,6 +7,7 @@ use base qw(PVE::Storage::Plugin);
 
 use JSON;
 use File::Basename;
+use File::Path qw(make_path);
 use IO::Socket::UNIX;
 use POSIX qw(SIGTERM SIGHUP);
 
@@ -135,9 +136,13 @@ sub _reload_daemon {
         my $pid = <$fh>;
         close $fh;
         chomp $pid;
-        kill SIGHUP, $pid if $pid;
+        # Untaint the PID (PVE runs with -T)
+        if ($pid && $pid =~ /^(\d+)$/) {
+            kill SIGHUP, $1;
+            return;
+        }
     }
-    # If no pidfile, try systemctl
+    # Fallback: try systemctl
     system('systemctl', 'reload', 'proxs3d') == 0 or
         warn "Could not reload proxs3d daemon\n";
 }
@@ -195,7 +200,8 @@ sub on_add_hook {
     if ($access_key && $secret_key) {
         _write_credentials($storeid, $access_key, $secret_key);
     }
-    _reload_daemon();
+    # Don't reload here — storage.cfg hasn't been written yet.
+    # The reload happens in activate_storage which runs after config is saved.
     return;
 }
 
@@ -208,6 +214,7 @@ sub on_update_hook {
     if ($access_key && $secret_key) {
         _write_credentials($storeid, $access_key, $secret_key);
     }
+    # Reload here — on update, storage.cfg is already written
     _reload_daemon();
     return;
 }
@@ -223,18 +230,46 @@ sub on_delete_hook {
 
 # --- Plugin Interface Methods ---
 
+sub check_config {
+    my ($self, $sectionId, $param, $create, $skipSchemaCheck) = @_;
+    my $opts = $self->SUPER::check_config($sectionId, $param, $create, $skipSchemaCheck);
+
+    # Set path so PVE's upload flow works (writes files to cache dir)
+    # The daemon monitors this directory and syncs to S3
+    $opts->{path} = "/var/cache/proxs3/$sectionId";
+    return $opts;
+}
+
 sub activate_storage {
     my ($class, $storeid, $scfg, $cache) = @_;
 
-    # Be lenient on activation — the daemon may still be starting up
-    # or the S3 endpoint may be temporarily unreachable. Proxmox will
-    # show the storage as unavailable via status() if it's offline.
+    # Ensure the cache path exists for PVE's upload flow
+    my $path = "/var/cache/proxs3/$storeid";
+    for my $sub (qw(template/iso template/cache snippets dump images)) {
+        my $dir = "$path/$sub";
+        File::Path::make_path($dir) if ! -d $dir;
+    }
+
+    # Check if daemon already knows this storage — if not, reload
+    my $needs_reload = 0;
     eval {
         _daemon_request('/v1/status', { storage => $storeid });
     };
     if ($@) {
-        warn "proxs3: storage '$storeid' activation warning: $@";
-        # Don't die — let Proxmox proceed and show degraded status
+        $needs_reload = 1;
+    }
+
+    if ($needs_reload) {
+        sleep 1; # pmxcfs sync delay
+        _reload_daemon();
+
+        # Re-check after reload
+        eval {
+            _daemon_request('/v1/status', { storage => $storeid });
+        };
+        if ($@) {
+            warn "proxs3: storage '$storeid' activation warning: $@";
+        }
     }
     return 1;
 }
@@ -319,6 +354,24 @@ sub upload {
     }
 
     return;
+}
+
+sub activate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
+
+    # Download from S3 to local cache on first access
+    my ($content, $filename) = _parse_volname($volname);
+    my $prefix = _content_to_prefix($content);
+    my $key = "${prefix}${filename}";
+
+    my $res = eval {
+        _daemon_request('/v1/download', { storage => $storeid, key => $key });
+    };
+    if ($@ || !$res->{path}) {
+        die "volume '$storeid:$volname' does not exist\n";
+    }
+
+    return 1;
 }
 
 sub clone_image {

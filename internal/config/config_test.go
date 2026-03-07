@@ -174,9 +174,12 @@ func TestLoadCredential_Missing(t *testing.T) {
 
 func TestLoadCredential_Empty(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "bad.json"), []byte(`{"access_key":"","secret_key":""}`), 0600)
-	_, err := LoadCredential(dir, "bad")
-	if err == nil {
-		t.Error("expected error for empty credentials")
+	os.WriteFile(filepath.Join(dir, "empty.json"), []byte(`{"access_key":"","secret_key":""}`), 0600)
+	cred, err := LoadCredential(dir, "empty")
+	if err != nil {
+		t.Errorf("empty credentials should be allowed (public buckets): %v", err)
+	}
+	if cred.AccessKey != "" || cred.SecretKey != "" {
+		t.Error("expected empty credentials")
 	}
 }

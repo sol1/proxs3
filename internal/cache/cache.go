@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,8 +23,8 @@ type FileMeta struct {
 }
 
 // FileCache provides a local filesystem cache for S3 objects.
-// Each cached file has an accompanying .meta JSON file tracking
-// the S3 ETag and LastModified so we can invalidate stale entries.
+// Metadata is stored in a .meta/ subdirectory to keep content
+// directories clean for the filesystem watcher.
 type FileCache struct {
 	baseDir string
 	maxMB   int64
@@ -61,15 +62,36 @@ func (fc *FileCache) Path(storageID, key string) string {
 	return p
 }
 
+// StoreMeta writes metadata for an already-cached file (e.g., after uploading to S3).
+func (fc *FileCache) StoreMeta(storageID, key string, meta FileMeta) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	meta.CachedAt = time.Now()
+	mp := fc.metaPath(storageID, key)
+	if err := os.MkdirAll(filepath.Dir(mp), 0755); err != nil {
+		return
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return
+	}
+	os.WriteFile(mp, data, 0644)
+}
+
 // GetMeta returns the stored metadata for a cached object, or nil if not cached.
 func (fc *FileCache) GetMeta(storageID, key string) *FileMeta {
 	fc.mu.RLock()
 	defer fc.mu.RUnlock()
 
-	metaPath := fc.path(storageID, key) + ".meta"
-	data, err := os.ReadFile(metaPath)
+	mp := fc.metaPath(storageID, key)
+	data, err := os.ReadFile(mp)
 	if err != nil {
-		return nil
+		// Fall back to legacy .meta sidecar location
+		data, err = os.ReadFile(fc.path(storageID, key) + ".meta")
+		if err != nil {
+			return nil
+		}
 	}
 	var meta FileMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
@@ -99,7 +121,8 @@ func (fc *FileCache) Invalidate(storageID, key string) {
 	defer fc.mu.Unlock()
 	p := fc.path(storageID, key)
 	os.Remove(p)
-	os.Remove(p + ".meta")
+	os.Remove(fc.metaPath(storageID, key))
+	os.Remove(p + ".meta") // clean up legacy location
 }
 
 // Store writes data from a reader into the cache with metadata, returning the local path.
@@ -123,10 +146,12 @@ func (fc *FileCache) Store(storageID, key string, r io.Reader, meta FileMeta) (s
 		return "", fmt.Errorf("writing cache file: %w", err)
 	}
 
-	// Write metadata
+	// Write metadata to .meta/ subdirectory
 	meta.CachedAt = time.Now()
 	metaData, _ := json.Marshal(meta)
-	os.WriteFile(p+".meta", metaData, 0644)
+	mp := fc.metaPath(storageID, key)
+	os.MkdirAll(filepath.Dir(mp), 0755)
+	os.WriteFile(mp, metaData, 0644)
 
 	// Evict if over limit (async, best-effort)
 	go fc.evictIfNeeded()
@@ -159,10 +184,12 @@ func (fc *FileCache) Link(storageID, key, srcPath string, meta FileMeta) {
 		io.Copy(dst, src)
 	}
 
-	// Write metadata
+	// Write metadata to .meta/ subdirectory
 	meta.CachedAt = time.Now()
 	metaData, _ := json.Marshal(meta)
-	os.WriteFile(p+".meta", metaData, 0644)
+	mp := fc.metaPath(storageID, key)
+	os.MkdirAll(filepath.Dir(mp), 0755)
+	os.WriteFile(mp, metaData, 0644)
 }
 
 // Remove deletes a cached file and its metadata.
@@ -170,7 +197,8 @@ func (fc *FileCache) Remove(storageID, key string) error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	p := fc.path(storageID, key)
-	os.Remove(p + ".meta")
+	os.Remove(fc.metaPath(storageID, key))
+	os.Remove(p + ".meta") // clean up legacy location
 	return os.Remove(p)
 }
 
@@ -189,6 +217,12 @@ func (fc *FileCache) SizeMB() int64 {
 
 func (fc *FileCache) path(storageID, key string) string {
 	return filepath.Join(fc.baseDir, storageID, key)
+}
+
+// metaPath returns the path for the metadata sidecar file,
+// stored in a .meta/ subdirectory to avoid polluting content directories.
+func (fc *FileCache) metaPath(storageID, key string) string {
+	return filepath.Join(fc.baseDir, ".meta", storageID, key+".json")
 }
 
 type cachedFile struct {
@@ -210,8 +244,11 @@ func (fc *FileCache) evictIfNeeded() {
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		// Skip .meta files from size accounting but they'll be cleaned
-		// when their parent file is evicted
+		// Skip the .meta directory entirely
+		if strings.Contains(path, string(os.PathSeparator)+".meta"+string(os.PathSeparator)) {
+			return nil
+		}
+		// Skip legacy .meta sidecar files
 		if filepath.Ext(path) == ".meta" {
 			return nil
 		}
@@ -244,7 +281,11 @@ func (fc *FileCache) evictIfNeeded() {
 		if err := os.Remove(f.path); err != nil {
 			continue
 		}
-		os.Remove(f.path + ".meta")
+		os.Remove(f.path + ".meta") // legacy cleanup
+		// Clean up .meta/ directory entry
+		if rel, err := filepath.Rel(fc.baseDir, f.path); err == nil {
+			os.Remove(filepath.Join(fc.baseDir, ".meta", rel+".json"))
+		}
 		totalSize -= f.size
 		log.Printf("cache evict: %s (%d MB remaining)", f.path, totalSize/(1024*1024))
 	}

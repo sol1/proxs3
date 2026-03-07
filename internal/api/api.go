@@ -123,6 +123,7 @@ func (s *Server) Start() error {
 	s.server = &http.Server{Handler: mux}
 
 	go s.healthLoop()
+	go s.watchCacheDirs()
 
 	return s.server.Serve(ln)
 }
@@ -221,8 +222,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.healthMu.RUnlock()
 
 	// S3 has no real capacity limit — report used from actual object sizes
-	// and always show 100 GiB free so PVE never thinks the storage is full
-	const headroom = 107374182400 // 100 GiB
+	// and always show headroom free so PVE never thinks the storage is full
+	headroom := s.cfg.HeadroomGB * 1073741824 // convert GiB to bytes
 	resp := StatusResponse{
 		StorageID: storageID,
 		Online:    online,

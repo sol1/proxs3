@@ -74,7 +74,8 @@ Edit `/etc/proxs3/proxs3d.json` on each node:
     "cache_dir": "/var/cache/proxs3",
     "cache_max_mb": 4096,
     "credential_dir": "/etc/pve/priv/proxs3",
-    "storage_cfg": "/etc/pve/storage.cfg"
+    "storage_cfg": "/etc/pve/storage.cfg",
+    "headroom_gb": 100
 }
 ```
 
@@ -179,6 +180,7 @@ You should now see any ISOs or templates you uploaded to the bucket. You can upl
 | `cache_max_mb` | `4096` | Maximum cache size in MB before LRU eviction |
 | `credential_dir` | `/etc/pve/priv/proxs3` | Directory containing per-storage credential files |
 | `storage_cfg` | `/etc/pve/storage.cfg` | Path to Proxmox storage configuration |
+| `headroom_gb` | `100` | Available space (in GiB) to report to Proxmox. S3 has no real capacity limit, so this is the "free space" PVE always sees. Set to match what makes sense for your environment. |
 | `proxy.http_proxy` | _(empty)_ | HTTP proxy URL for outbound connections |
 | `proxy.https_proxy` | _(empty)_ | HTTPS proxy URL for outbound connections |
 | `proxy.no_proxy` | _(empty)_ | Comma-separated list of hosts to bypass proxy |

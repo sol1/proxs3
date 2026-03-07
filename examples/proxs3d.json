@@ -4,6 +4,7 @@
     "cache_max_mb": 4096,
     "credential_dir": "/etc/pve/priv/proxs3",
     "storage_cfg": "/etc/pve/storage.cfg",
+    "headroom_gb": 100,
     "proxy": {
         "https_proxy": "",
         "http_proxy": "",
