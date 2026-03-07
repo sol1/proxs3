@@ -5,4 +5,4 @@ proxs3 (0.1.0-1) unstable; urgency=medium
   * Perl PVE storage plugin for iso, vztmpl, snippets, backup
   * systemd service unit
 
- -- Sol1 <dev@sol1.com.au>  Fri, 07 Mar 2026 17:00:00 +0000
+ -- Dave Kempe <dave@sol1.com.au>  Fri, 07 Mar 2026 17:00:00 +0000

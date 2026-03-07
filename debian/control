@@ -1,7 +1,7 @@
 Source: proxs3
 Section: admin
 Priority: optional
-Maintainer: Sol1 <dev@sol1.com.au>
+Maintainer: Dave Kempe <dave@sol1.com.au>
 Build-Depends: debhelper-compat (= 13), golang-go (>= 2:1.22~)
 Standards-Version: 4.6.2
 Homepage: https://github.com/sol1/proxs3
