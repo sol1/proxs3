@@ -1,0 +1,19 @@
+Source: proxs3
+Section: admin
+Priority: optional
+Maintainer: Dave <dave@daveio.dev>
+Build-Depends: debhelper-compat (= 13), golang-go (>= 2:1.22~)
+Standards-Version: 4.6.2
+Homepage: https://github.com/daveio/proxs3
+
+Package: proxs3
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, pve-manager (>= 8.0), libhttp-tiny-perl, libjson-perl
+Description: S3 storage plugin for Proxmox VE
+ ProxS3 provides native S3 storage support for Proxmox VE.
+ It consists of a Go daemon (proxs3d) that handles S3 operations,
+ caching, and health monitoring, paired with a Perl storage plugin
+ that integrates directly with Proxmox's storage subsystem.
+ .
+ Supported content types: ISO images, container templates,
+ snippets, and backups.

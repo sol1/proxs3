@@ -1,0 +1,6 @@
+/proxs3d
+_build/
+*.deb
+*.buildinfo
+*.changes
+.claude/

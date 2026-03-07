@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export GOPATH = $(CURDIR)/_build
+export GOCACHE = $(CURDIR)/_build/cache
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	go build -o proxs3d ./cmd/proxs3d
+
+override_dh_auto_install:
+	# Go daemon
+	install -D -m 0755 proxs3d $(CURDIR)/debian/proxs3/usr/bin/proxs3d
+
+	# Perl plugin
+	install -D -m 0644 perl/S3Plugin.pm \
+		$(CURDIR)/debian/proxs3/usr/share/perl5/PVE/Storage/Custom/S3Plugin.pm
+
+	# systemd unit
+	install -D -m 0644 systemd/proxs3d.service \
+		$(CURDIR)/debian/proxs3/lib/systemd/system/proxs3d.service
+
+	# Example config
+	install -D -m 0640 examples/proxs3d.json \
+		$(CURDIR)/debian/proxs3/etc/proxs3/proxs3d.json
+
+	# Cache directory
+	install -d -m 0755 $(CURDIR)/debian/proxs3/var/cache/proxs3
+
+override_dh_auto_test:
+	# Tests require S3 connectivity, skip in packaging
+	true
+
+override_dh_auto_clean:
+	rm -f proxs3d
+	rm -rf _build

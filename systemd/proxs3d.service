@@ -1,0 +1,23 @@
+[Unit]
+Description=ProxS3 Storage Daemon
+Documentation=https://github.com/daveio/proxs3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/proxs3d -config /etc/proxs3/proxs3d.json
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=proxs3
+CacheDirectory=proxs3
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/cache/proxs3 /run/proxs3d.sock
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

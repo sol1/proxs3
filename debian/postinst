@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        systemctl daemon-reload
+        systemctl enable proxs3d.service
+        # Don't auto-start — user needs to configure first
+        echo "ProxS3 installed. Edit /etc/proxs3/proxs3d.json then run:"
+        echo "  systemctl start proxs3d"
+        echo ""
+        echo "Then add storage in /etc/pve/storage.cfg:"
+        echo "  s3: my-s3-store"
+        echo "      endpoint s3.example.com"
+        echo "      bucket my-bucket"
+        echo "      access-key AKID..."
+        echo "      secret-key SECRET..."
+        echo "      content iso,vztmpl,snippets"
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

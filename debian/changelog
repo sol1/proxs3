@@ -1,0 +1,8 @@
+proxs3 (0.1.0-1) unstable; urgency=medium
+
+  * Initial release
+  * Go daemon (proxs3d) with S3 client, local cache, health monitoring
+  * Perl PVE storage plugin for iso, vztmpl, snippets, backup
+  * systemd service unit
+
+ -- Dave <dave@daveio.dev>  Fri, 07 Mar 2026 17:00:00 +0000
