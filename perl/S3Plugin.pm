@@ -28,7 +28,7 @@ sub type {
 sub plugindata {
     return {
         content => [
-            { images => 0, rootdir => 0, vztmpl => 1, iso => 1, backup => 1, snippets => 1, none => 0 },
+            { images => 1, rootdir => 0, vztmpl => 1, iso => 1, backup => 1, snippets => 1, none => 0 },
             { iso => 1, vztmpl => 1, snippets => 1 },
         ],
         format => [ { raw => 1 } , 'raw' ],

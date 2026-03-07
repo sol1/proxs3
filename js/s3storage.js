@@ -26,6 +26,14 @@ Ext.define('PVE.storage.S3InputPanel', {
 		emptyText: 'us-east-1',
 		allowBlank: true,
 	    },
+	    {
+		xtype: 'pveContentTypeSelector',
+		name: 'content',
+		value: 'iso',
+		multiSelect: true,
+		fieldLabel: gettext('Content'),
+		allowBlank: false,
+	    },
 	];
 
 	me.column2 = [
