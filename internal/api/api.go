@@ -119,6 +119,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/v1/upload", s.handleUpload)
 	mux.HandleFunc("/v1/delete", s.handleDelete)
 	mux.HandleFunc("/v1/path", s.handlePath)
+	mux.HandleFunc("/v1/config", s.handleConfig)
 
 	s.server = &http.Server{Handler: mux}
 
@@ -429,6 +430,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePath(w http.ResponseWriter, r *http.Request) {
 	// Path always validates and downloads if needed — delegates to download handler
 	s.handleDownload(w, r)
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]string{
+		"cache_dir": s.cfg.CacheDir,
+	})
 }
 
 // --- Helpers ---

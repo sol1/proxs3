@@ -12,13 +12,12 @@ Restart=on-failure
 RestartSec=5
 PIDFile=/run/proxs3d.pid
 RuntimeDirectory=proxs3
-CacheDirectory=proxs3
 
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/cache/proxs3 /run
+ReadWritePaths=/var/cache /run
 ReadOnlyPaths=/etc/pve /etc/proxs3
 PrivateTmp=yes
 

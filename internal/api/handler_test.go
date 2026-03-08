@@ -683,6 +683,28 @@ func TestHandlePath_DelegatesToDownload(t *testing.T) {
 	}
 }
 
+// --- Config handler tests ---
+
+func TestHandleConfig(t *testing.T) {
+	mock := newMockClient("s3test")
+	s := newTestServer(t, mock)
+
+	req := httptest.NewRequest("GET", "/v1/config", nil)
+	w := httptest.NewRecorder()
+	s.handleConfig(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	if resp["cache_dir"] != s.cfg.CacheDir {
+		t.Errorf("expected cache_dir %q, got %q", s.cfg.CacheDir, resp["cache_dir"])
+	}
+}
+
 // --- Health check tests ---
 
 func TestCheckAllHealth_Healthy(t *testing.T) {

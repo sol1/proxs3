@@ -244,7 +244,8 @@ sub check_config {
 
     # Set path so PVE's upload flow works (writes files to cache dir)
     # The daemon monitors this directory and syncs to S3
-    $opts->{path} = "/var/cache/proxs3/$sectionId";
+    my $cache_dir = _get_cache_dir();
+    $opts->{path} = "$cache_dir/$sectionId";
     return $opts;
 }
 
@@ -252,7 +253,8 @@ sub activate_storage {
     my ($class, $storeid, $scfg, $cache) = @_;
 
     # Ensure the cache path exists for PVE's upload flow
-    my $path = "/var/cache/proxs3/$storeid";
+    my $cache_dir = _get_cache_dir();
+    my $path = "$cache_dir/$storeid";
     for my $sub (qw(template/iso template/cache snippets dump images)) {
         my $dir = "$path/$sub";
         File::Path::make_path($dir) if ! -d $dir;
@@ -415,6 +417,19 @@ sub _parse_volname {
         $filename = $2;
     }
     return ($content, $filename);
+}
+
+my $_cache_dir_cached;
+
+sub _get_cache_dir {
+    return $_cache_dir_cached if defined $_cache_dir_cached;
+
+    my $res = eval { _daemon_request('/v1/config', {}) };
+    if ($@ || !$res->{cache_dir}) {
+        die "Cannot determine cache directory from proxs3d: $@\n";
+    }
+    $_cache_dir_cached = $res->{cache_dir};
+    return $_cache_dir_cached;
 }
 
 sub _content_to_prefix {
