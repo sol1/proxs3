@@ -170,6 +170,10 @@ func ParseStorageCfg(path string) ([]StorageConfig, error) {
 
 			switch key {
 			case "endpoint":
+				// Strip protocol prefix and trailing slash if user included them
+				val = strings.TrimPrefix(val, "https://")
+				val = strings.TrimPrefix(val, "http://")
+				val = strings.TrimRight(val, "/")
 				current.Endpoint = val
 			case "bucket":
 				current.Bucket = val

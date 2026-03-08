@@ -255,9 +255,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prefix := contentToPrefix(content)
-	objects, err := client.ListObjects(r.Context(), prefix)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	objects, err := client.ListObjects(ctx, prefix)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// S3 unreachable — return empty list rather than blocking PVE
+		log.Printf("list failed for %s/%s (S3 unreachable?): %v", storageID, content, err)
+		writeJSON(w, []VolumeInfo{})
 		return
 	}
 
@@ -290,19 +294,27 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if we have a valid (non-stale) cache entry
+	// Check if we have a cached entry
 	if cached := s.cache.Path(storageID, key); cached != "" {
 		// Validate against S3 metadata (HeadObject is cheap)
-		info, err := client.HeadObject(r.Context(), key)
-		if err == nil && !s.cache.IsStale(storageID, key, info.ETag, info.LastModified) {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		info, err := client.HeadObject(ctx, key)
+		cancel()
+		if err != nil {
+			// S3 unreachable — serve stale cache rather than failing
+			log.Printf("download: S3 unreachable for %s, serving cached copy", key)
 			writeJSON(w, map[string]string{"path": cached})
 			return
 		}
-		// Stale or head failed — invalidate and re-download
+		if !s.cache.IsStale(storageID, key, info.ETag, info.LastModified) {
+			writeJSON(w, map[string]string{"path": cached})
+			return
+		}
+		// Stale — invalidate and re-download
 		s.cache.Invalidate(storageID, key)
 	}
 
-	// Download from S3
+	// Download from S3 (no tight timeout here — large files take time)
 	result, err := client.GetObject(r.Context(), key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

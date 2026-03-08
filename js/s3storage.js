@@ -12,12 +12,14 @@ Ext.define('PVE.storage.S3InputPanel', {
 		name: 'endpoint',
 		fieldLabel: 'Endpoint',
 		allowBlank: false,
+		emptyText: 'hostname only, e.g. s3.us-east-1.amazonaws.com',
 	    },
 	    {
 		xtype: me.isCreate ? 'textfield' : 'displayfield',
 		name: 'bucket',
 		fieldLabel: 'Bucket',
 		allowBlank: false,
+		emptyText: 'my-bucket-name',
 	    },
 	    {
 		xtype: 'textfield',
@@ -29,10 +31,10 @@ Ext.define('PVE.storage.S3InputPanel', {
 	    {
 		xtype: 'pveContentTypeSelector',
 		name: 'content',
-		value: 'iso,vztmpl,snippets',
 		multiSelect: true,
 		fieldLabel: gettext('Content'),
 		allowBlank: false,
+		cts: ['iso', 'vztmpl', 'snippets', 'backup', 'import'],
 	    },
 	];
 
@@ -60,11 +62,15 @@ Ext.define('PVE.storage.S3InputPanel', {
 		uncheckedValue: 0,
 	    },
 	    {
-		xtype: 'proxmoxcheckbox',
+		xtype: 'proxmoxKVComboBox',
 		name: 'path-style',
-		fieldLabel: 'Path Style',
-		checked: false,
-		uncheckedValue: 0,
+		fieldLabel: 'URL Style',
+		comboItems: [
+		    ['0', 'Virtual-hosted (bucket.endpoint)'],
+		    ['1', 'Path (endpoint/bucket)'],
+		],
+		value: '0',
+		allowBlank: false,
 	    },
 	];
 

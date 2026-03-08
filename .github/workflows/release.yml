@@ -39,21 +39,3 @@ jobs:
           files: |
             ../proxs3_*.deb
           generate_release_notes: true
-
-  build-binary:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-
-      - name: Build binary
-        run: go build -o proxs3d-linux-amd64 ./cmd/proxs3d
-
-      - name: Upload release artifacts
-        uses: softprops/action-gh-release@v2
-        with:
-          files: proxs3d-linux-amd64

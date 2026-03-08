@@ -2,7 +2,16 @@
 
 Native S3 storage plugin for Proxmox VE. Use any S3-compatible object store as a Proxmox storage backend for ISO images, container templates, snippets, and backups.
 
-Unlike FUSE-based approaches (s3fs, rclone mount), ProxS3 integrates directly with Proxmox's storage subsystem. Proxmox understands the storage is remote, handles disconnects gracefully, and shows proper status in the web UI.
+## Why Not s3fs / rclone mount?
+
+FUSE-based S3 mounts (s3fs, rclone, goofys) pretend to be local filesystems. This works until it doesn't:
+
+- **Network outage kills the cluster.** When the proxy or internet goes down, the FUSE mount hangs or disappears. PVE's storage polling (pvestatd) tries to stat the mountpoint, blocks, backs up, and the whole cluster suffers. Other storages get affected because the polling loop is stuck.
+- **No graceful degradation.** A hung FUSE mount can't return "offline" — it just blocks until the kernel times out. PVE has no way to know the storage is unreachable vs just slow.
+- **Phantom filesystem.** PVE thinks it's talking to a local directory, so it has no concept of the storage being "online" or "offline". There's no health check, no status indicator, no way to distinguish "the file doesn't exist" from "the network is down".
+- **Cache coherency problems.** FUSE caches are opaque to PVE. Stale data, partial reads, and silent corruption are common under load or network instability.
+
+ProxS3 takes a different approach: it's a **native Proxmox storage plugin** that understands it's talking to a remote object store. S3 operations happen in a separate Go daemon, never in PVE's critical path. The local cache is a real filesystem directory that always exists. When S3 is unreachable, PVE sees `online: false` instantly — no blocking, no hung mounts, no cascading failures.
 
 ## How It Works
 
@@ -16,16 +25,30 @@ Proxmox UI / pvesm CLI
        |
        v
   S3Plugin.pm  (PVE::Storage::Custom)
-       | Unix socket
+       | Unix socket (always local, never blocks on network)
        v
     proxs3d    (Go daemon)
        | HTTPS              | local disk
        v                    v
    S3 bucket            file cache
-  (source of truth)   (per-node, validated)
+  (source of truth)   (real directory, always exists)
 ```
 
 The daemon auto-discovers S3 storages from `/etc/pve/storage.cfg`. When you add, update, or remove an S3 storage via the Proxmox UI or `pvesm`, the plugin signals the daemon to reload automatically.
+
+### Network Failure Behaviour
+
+When the S3 endpoint becomes unreachable (proxy down, internet outage, provider issue):
+
+| PVE Operation | What Happens | Impact |
+|---|---|---|
+| Status polling (pvestatd) | Returns `online: false` from cached state | **No blocking.** Storage shows as unavailable immediately. Other storages unaffected. |
+| List volumes | 10s timeout, returns empty list | **Brief delay then graceful.** UI shows no contents but doesn't hang. |
+| Access a cached file | Serves local cached copy (skips S3 validation) | **Works offline.** Running VMs keep working with cached ISOs/templates. |
+| Access an uncached file | Returns error | **Expected.** Can't download what we don't have. |
+| Upload | File saved to local cache, S3 upload fails and is logged | **No data loss.** File is preserved locally. |
+
+When connectivity returns, the health check picks it up within 30 seconds and the storage goes green again. No manual intervention needed.
 
 ## Requirements
 
@@ -43,10 +66,10 @@ On **each Proxmox node** in your cluster:
 
 ```bash
 # Download the .deb from the latest release
-wget https://github.com/sol1/proxs3/releases/latest/download/proxs3_0.1.0-1_amd64.deb
+wget https://github.com/sol1/proxs3/releases/latest/download/proxs3_0.1.2-1_amd64.deb
 
 # Install
-dpkg -i proxs3_0.1.0-1_amd64.deb
+dpkg -i proxs3_0.1.2-1_amd64.deb
 ```
 
 This installs:
@@ -136,17 +159,33 @@ Go to **Datacenter -> Storage -> Add -> S3** and fill in the fields.
 **Option B: Via the command line**
 
 ```bash
+# AWS S3 example — note: endpoint is just the hostname, no https://
 pvesm add s3 my-s3-store \
-    --endpoint s3.amazonaws.com \
+    --endpoint s3.us-east-1.amazonaws.com \
     --bucket my-proxmox-bucket \
     --region us-east-1 \
     --access-key AKIAIOSFODNN7EXAMPLE \
     --secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
     --content iso,vztmpl,snippets \
     --use-ssl 1
-```
 
-For MinIO or other S3-compatible stores that use path-style URLs, add `--path-style 1`.
+# DigitalOcean Spaces example
+pvesm add s3 my-do-store \
+    --endpoint syd1.digitaloceanspaces.com \
+    --bucket my-space-name \
+    --region syd1 \
+    --access-key DO00EXAMPLE \
+    --secret-key secretkeyhere \
+    --content iso,vztmpl,snippets \
+    --use-ssl 1
+
+# MinIO example — note: path-style 1 required
+pvesm add s3 my-minio-store \
+    --endpoint minio.local:9000 \
+    --bucket my-bucket \
+    --content iso,vztmpl,snippets \
+    --path-style 1
+```
 
 **What happens behind the scenes:**
 
@@ -189,15 +228,32 @@ You should now see any ISOs or templates you uploaded to the bucket. You can upl
 
 | Field | Required | Description |
 |---|---|---|
-| `endpoint` | Yes | S3 endpoint hostname (e.g., `s3.amazonaws.com`, `minio.local:9000`) |
+| `endpoint` | Yes | S3 endpoint hostname — see **Endpoint and URL Style** below |
 | `bucket` | Yes | S3 bucket name |
 | `region` | No | S3 region (defaults to `us-east-1`) |
-| `access-key` | Yes | S3 access key ID |
-| `secret-key` | Yes | S3 secret access key |
-| `content` | No | Comma-separated content types: `iso`, `vztmpl`, `snippets`, `backup` |
+| `access-key` | No | S3 access key ID (omit for public buckets) |
+| `secret-key` | No | S3 secret access key (omit for public buckets) |
+| `content` | No | Comma-separated content types: `iso`, `vztmpl`, `snippets`, `backup`, `import` |
 | `use-ssl` | No | Use HTTPS (`1`) or HTTP (`0`). Defaults to on. |
-| `path-style` | No | Use path-style URLs (`1`) instead of virtual-hosted-style (`0`). Required for MinIO. |
+| `path-style` | No | URL style — see **Endpoint and URL Style** below |
 | `nodes` | No | Restrict storage to specific cluster nodes |
+
+### Endpoint and URL Style
+
+The **endpoint** field must be the **base hostname only** — no `https://` prefix, no bucket name, no trailing slash.
+
+S3 has two URL styles for addressing buckets:
+
+| Style | URL Format | `path-style` | Example |
+|---|---|---|---|
+| **Virtual-hosted** (default) | `https://BUCKET.ENDPOINT/key` | `0` | `https://my-bucket.s3.amazonaws.com/template/iso/debian.iso` |
+| **Path** | `https://ENDPOINT/BUCKET/key` | `1` | `https://minio.local:9000/my-bucket/template/iso/debian.iso` |
+
+**Common mistake:** If your provider gives you a URL like `https://my-bucket.syd1.digitaloceanspaces.com`, the endpoint is just `syd1.digitaloceanspaces.com` — the bucket name is already a separate field. Don't include it in the endpoint or it will be doubled.
+
+**How to choose:**
+- **AWS S3, DigitalOcean Spaces, Wasabi, Cloudflare R2, Backblaze B2** → Virtual-hosted (`path-style 0`, the default)
+- **MinIO, Ceph RGW, most self-hosted S3** → Path style (`path-style 1`)
 
 ### HTTP Proxy
 
@@ -219,16 +275,18 @@ The proxy settings apply to all outbound S3 connections from the daemon.
 
 ProxS3 works with any S3-compatible object store. Here are the recommended settings for common providers:
 
-| Provider | `endpoint` | `use-ssl` | `path-style` |
-|---|---|---|---|
-| AWS S3 | `s3.amazonaws.com` | `1` | `0` |
-| AWS S3 (regional) | `s3.us-west-2.amazonaws.com` | `1` | `0` |
-| MinIO | `minio.local:9000` | depends | `1` |
-| Ceph RGW | `rgw.local:7480` | depends | `1` |
-| Cloudflare R2 | `<account-id>.r2.cloudflarestorage.com` | `1` | `0` |
-| Wasabi | `s3.wasabisys.com` | `1` | `0` |
-| Backblaze B2 | `s3.us-west-004.backblazeb2.com` | `1` | `0` |
-| DigitalOcean Spaces | `<region>.digitaloceanspaces.com` | `1` | `0` |
+| Provider | `endpoint` | `region` | `use-ssl` | `path-style` |
+|---|---|---|---|---|
+| AWS S3 | `s3.us-east-1.amazonaws.com` | `us-east-1` | `1` | `0` |
+| AWS S3 (other region) | `s3.ap-southeast-2.amazonaws.com` | `ap-southeast-2` | `1` | `0` |
+| DigitalOcean Spaces | `syd1.digitaloceanspaces.com` | `syd1` | `1` | `0` |
+| Wasabi | `s3.wasabisys.com` | `us-east-1` | `1` | `0` |
+| Cloudflare R2 | `<account-id>.r2.cloudflarestorage.com` | `auto` | `1` | `0` |
+| Backblaze B2 | `s3.us-west-004.backblazeb2.com` | `us-west-004` | `1` | `0` |
+| MinIO | `minio.local:9000` | | depends | `1` |
+| Ceph RGW | `rgw.local:7480` | | depends | `1` |
+
+**Note:** The endpoint is always just the hostname (and port if non-standard). Never include `https://`, the bucket name, or a trailing slash.
 
 ## Caching
 
