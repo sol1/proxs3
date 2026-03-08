@@ -114,6 +114,21 @@ The `cache_max_mb` setting controls the maximum cache size in megabytes. When ex
 
 This config file is **per-node** (it's in `/etc/proxs3/`, not `/etc/pve/`) so you can set different cache paths and sizes on different nodes.
 
+**If you set `cache_dir` outside `/var/cache/`**, you need a systemd override so the daemon has write access (it runs with `ProtectSystem=strict`):
+
+```bash
+systemctl edit proxs3d
+```
+
+Add:
+
+```ini
+[Service]
+ReadWritePaths=/mnt/proxs3-cache /run
+```
+
+Then restart: `systemctl restart proxs3d`
+
 ### Step 3: Prepare your S3 bucket
 
 Create a bucket in your S3-compatible store and set up the expected directory structure. ProxS3 uses these key prefixes:
