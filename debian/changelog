@@ -1,3 +1,9 @@
+proxs3 (0.2.3-1) unstable; urgency=medium
+
+  * Add stable-named deb (proxs3_amd64.deb) to release pipeline
+
+ -- Dave Kempe <dave@sol1.com.au>  Sun, 09 Mar 2026 15:00:00 +0000
+
 proxs3 (0.2.2-1) unstable; urgency=medium
 
   * Show S3 bucket@endpoint in PVE Path/Target column instead of cache path

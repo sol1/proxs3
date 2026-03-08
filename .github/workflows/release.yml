@@ -33,9 +33,13 @@ jobs:
       - name: Build .deb package
         run: dpkg-buildpackage -us -uc -b -d
 
+      - name: Create stable-named copy for latest URL
+        run: cp ../proxs3_${{ steps.version.outputs.version }}-1_amd64.deb ../proxs3_amd64.deb
+
       - name: Upload release artifacts
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ../proxs3_*.deb
+            ../proxs3_${{ steps.version.outputs.version }}-1_amd64.deb
+            ../proxs3_amd64.deb
           generate_release_notes: true
