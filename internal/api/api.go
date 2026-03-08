@@ -21,7 +21,7 @@ import (
 // Server is the Unix socket API server that the Perl plugin communicates with.
 type Server struct {
 	cfg      *config.DaemonConfig
-	clients  map[string]*s3client.Client
+	clients  map[string]s3client.S3Client
 	cache    *cache.FileCache
 	health   map[string]bool
 	usage    map[string]int64
@@ -40,7 +40,7 @@ func New(cfg *config.DaemonConfig) (*Server, error) {
 
 	s := &Server{
 		cfg:     cfg,
-		clients: make(map[string]*s3client.Client),
+		clients: make(map[string]s3client.S3Client),
 		cache:   fc,
 		health:  make(map[string]bool),
 		usage:   make(map[string]int64),
@@ -54,7 +54,7 @@ func New(cfg *config.DaemonConfig) (*Server, error) {
 }
 
 func (s *Server) initClients(cfg *config.DaemonConfig) error {
-	clients := make(map[string]*s3client.Client)
+	clients := make(map[string]s3client.S3Client)
 	health := make(map[string]bool)
 
 	for _, sc := range cfg.Storages {
@@ -211,7 +211,7 @@ func (s *Server) evictByAge() {
 	}
 }
 
-func (s *Server) getClient(storageID string) (*s3client.Client, bool) {
+func (s *Server) getClient(storageID string) (s3client.S3Client, bool) {
 	s.clientMu.RLock()
 	defer s.clientMu.RUnlock()
 	c, ok := s.clients[storageID]

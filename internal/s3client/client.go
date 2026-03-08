@@ -15,6 +15,17 @@ import (
 	"github.com/sol1/proxs3/internal/config"
 )
 
+// S3Client is the interface used by the API server for S3 operations.
+type S3Client interface {
+	StorageID() string
+	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
+	HeadObject(ctx context.Context, key string) (*ObjectInfo, error)
+	GetObject(ctx context.Context, key string) (*GetObjectResult, error)
+	PutObject(ctx context.Context, key string, body io.Reader, size int64) error
+	DeleteObject(ctx context.Context, key string) error
+	HeadBucket(ctx context.Context) error
+}
+
 // Client wraps the AWS S3 client for a single storage backend.
 type Client struct {
 	s3     *s3.Client
