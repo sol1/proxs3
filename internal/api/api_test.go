@@ -13,7 +13,7 @@ func TestContentToPrefix(t *testing.T) {
 		{"vztmpl", "template/cache/"},
 		{"snippets", "snippets/"},
 		{"backup", "dump/"},
-		{"import", "images/"},
+		{"import", "import/"},
 		{"unknown", "unknown/"},
 		{"", "/"},
 	}
@@ -65,7 +65,7 @@ func TestPrefixDirs(t *testing.T) {
 		"template/cache": "template/cache/",
 		"snippets":       "snippets/",
 		"dump":           "dump/",
-		"images":         "images/",
+		"import":         "import/",
 	}
 	for key, val := range expected {
 		got, ok := prefixDirs[key]
@@ -91,7 +91,7 @@ func TestContentToPrefixRoundTrip(t *testing.T) {
 		"iso":    "template/iso/",
 		"vztmpl": "template/cache/",
 		"backup": "dump/",
-		"import": "images/",
+		"import": "import/",
 	}
 	for ct, expected := range nonObvious {
 		prefix := contentToPrefix(ct)

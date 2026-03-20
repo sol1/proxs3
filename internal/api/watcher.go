@@ -18,7 +18,7 @@ var prefixDirs = map[string]string{
 	"template/cache": "template/cache/",
 	"snippets":       "snippets/",
 	"dump":           "dump/",
-	"images":         "images/",
+	"import":         "import/",
 }
 
 // watchCacheDirs watches the cache subdirectories for all configured storages.

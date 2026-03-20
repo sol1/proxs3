@@ -1,3 +1,9 @@
+proxs3 (0.3.0-1) unstable; urgency=medium
+
+  * Fix import support for disk images
+
+ -- Dave Kempe <dave@sol1.com.au>  Sat, 21 Mar 2026 08:30:00 +1100
+
 proxs3 (0.2.4-1) unstable; urgency=medium
 
   * Fix taint-mode error in activate_storage when creating cache directories

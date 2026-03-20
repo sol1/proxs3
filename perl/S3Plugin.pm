@@ -296,7 +296,7 @@ sub activate_storage {
     ($cache_base) = $cache_base =~ /\A([a-zA-Z0-9._\/-]+)\z/ or die "Invalid cache dir: $cache_base\n";
     (my $safe_sid) = $storeid =~ /\A([a-zA-Z0-9._-]+)\z/ or die "Invalid storage id: $storeid\n";
     my $path = "$cache_base/$safe_sid";
-    for my $sub (qw(template/iso template/cache snippets dump images)) {
+    for my $sub (qw(template/iso template/cache snippets dump import)) {
         my $dir = "$path/$sub";
         File::Path::make_path($dir) if ! -d $dir;
     }
@@ -361,7 +361,7 @@ sub path {
         die "Failed to resolve path for $volname: $@\n";
     }
 
-    return ($res->{path}, $content, 'raw');
+    return ($res->{path}, undef, $content);
 }
 
 # Upload: called by Proxmox when user uploads an ISO/template via UI or API
@@ -446,7 +446,7 @@ sub _content_to_prefix {
         vztmpl   => 'template/cache/',
         snippets => 'snippets/',
         backup   => 'dump/',
-        import   => 'images/',
+        import   => 'import/',
     );
     return $map{$content} // "${content}/";
 }

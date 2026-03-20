@@ -449,7 +449,7 @@ func contentToPrefix(content string) string {
 	case "backup":
 		return "dump/"
 	case "import":
-		return "images/"
+		return "import/"
 	default:
 		return content + "/"
 	}
