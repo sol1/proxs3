@@ -1,6 +1,8 @@
 proxs3 (0.3.0-1) unstable; urgency=medium
 
-  * Fix import support for disk images
+  * Fix import content type: align S3/cache prefix with PVE expected layout
+  * Fix path() return signature to match PVE ($path, $vmid, $vtype) convention
+  * Fix watcher and cache directory creation for import subdirectory
 
  -- Dave Kempe <dave@sol1.com.au>  Sat, 21 Mar 2026 08:30:00 +1100
 
