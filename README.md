@@ -342,15 +342,41 @@ The daemon checks file ages hourly. Files older than `cache-max-age` days (by mo
 
 This is separate from `cache_max_mb` (the daemon-wide size limit) and from `prune-backups` (which controls backup retention in S3 itself, not the local cache).
 
-## Multi-Node Clusters
+## Multi-Node Clusters and Shared Storage
 
-ProxS3 is designed for Proxmox clusters where you want every node to have access to the same ISOs and templates:
+ProxS3 registers as **shared storage** in PVE, meaning the cluster treats it like NFS or Ceph — all nodes see the same data. This is correct because S3 is inherently shared: every node accesses the same bucket.
 
 - **Add the storage once.** `storage.cfg` is shared across all nodes via pmxcfs. After `pvesm add`, every node sees the storage.
 - **Credentials are cluster-shared.** Stored in `/etc/pve/priv/proxs3/`, distributed by pmxcfs. Root-only permissions (0600).
 - **Install the .deb on each node.** The daemon and plugin must be present on every node that needs access.
 - **Cache is per-node.** Each node maintains its own local cache. Nodes pull from S3 independently and validate against S3 metadata.
 - **Daemon config is per-node.** `/etc/proxs3/proxs3d.json` is local to each node, so you can set different cache paths and sizes per node.
+
+### How shared storage works with a local cache
+
+Traditional shared storage (NFS, Ceph) provides a single filesystem visible to all nodes simultaneously. ProxS3 is different — S3 is the shared source of truth, but each node has an independent local cache.
+
+This works because:
+
+1. **Volume listing queries S3 directly**, not the cache. When PVE lists available ISOs or templates, every node sees the same results from the bucket.
+2. **`activate_volume` downloads on demand.** When a node needs a file, it downloads from S3 to its local cache. The cache is validated against S3 metadata (ETag) on each access, so stale copies are automatically refreshed.
+3. **Uploads propagate via S3.** When a file is uploaded on one node, the watcher uploads it to S3. Other nodes see it on their next volume listing. There is a brief window (seconds) between upload and S3 visibility.
+
+For a read-heavy, write-rarely workload (ISOs, templates, golden disk images), this model works well. Files are written once, read many times, and the cache ensures fast local access after the first download.
+
+### What shared storage enables
+
+- **Backups visible cluster-wide.** A backup created on node A appears in PVE's backup list on all nodes.
+- **Live migration.** PVE skips disk transfer for shared storage during migration (though VMs should not have S3-backed live disks — see limitations below).
+- **HA failover.** PVE knows the storage is accessible from any node.
+- **Template cloning from any node.** The same S3-backed template is available on every node in every cluster that has the storage configured.
+
+### Limitations of the shared model
+
+- **No live VM disks.** S3 cannot provide block-level random access. VMs must run from local storage. The `images` content type is for template disks that are cloned to local storage before use.
+- **No linked clones.** Linked clones create a qcow2 overlay referencing the base image in the cache. If the cache evicts the base image, the overlay breaks. Always use full clones (`--full`) when cloning from S3 templates.
+- **Cache eviction affects availability.** If a cached file is evicted, the next access triggers a re-download from S3. For large files over slow links, this adds latency. Size your cache (`cache_max_mb`) and age policy (`cache-max-age`) to keep frequently-used files cached.
+- **Upload visibility delay.** After uploading a file, there is a brief delay (typically seconds) before it appears in S3 and becomes visible to other nodes.
 
 ## Daemon Management
 

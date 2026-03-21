@@ -1,3 +1,9 @@
+proxs3 (0.4.2-1) unstable; urgency=medium
+
+  * Register as shared storage — all nodes see the same S3 bucket
+
+ -- Dave Kempe <dave@sol1.com.au>  Sun, 22 Mar 2026 09:57:00 +1100
+
 proxs3 (0.4.1-1) unstable; urgency=medium
 
   * Implement alloc_image for disk clone support

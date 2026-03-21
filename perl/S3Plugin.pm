@@ -254,6 +254,9 @@ sub check_config {
     (my $safe_sid) = $sectionId =~ /\A([a-zA-Z0-9._-]+)\z/ or die "Invalid storage id: $sectionId\n";
     $opts->{path} = "$cache_base/$safe_sid";
 
+    # S3 is inherently shared — all nodes see the same bucket
+    $opts->{shared} = 1;
+
     # Set target so PVE shows the S3 endpoint in the Path/Target column
     my $endpoint = $param->{endpoint} // $opts->{endpoint} // '';
     my $bucket = $param->{bucket} // $opts->{bucket} // '';
