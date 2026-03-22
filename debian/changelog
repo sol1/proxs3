@@ -1,3 +1,9 @@
+proxs3 (0.5.2-1) unstable; urgency=medium
+
+  * Fix duplicate volume names on rapid consecutive allocations
+
+ -- Dave Kempe <dave@sol1.com.au>  Sun, 22 Mar 2026 20:35:00 +1100
+
 proxs3 (0.5.1-1) unstable; urgency=medium
 
   * Fix volume_size_info to match file_size_info return convention

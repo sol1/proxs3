@@ -547,8 +547,18 @@ sub alloc_image {
     ($size) = $size =~ /\A(\d+)\z/ or die "Invalid size: $size\n";
 
     if (!$name) {
-        # Use find_free_diskname which queries S3 via list_images, not just local cache
+        # Use find_free_diskname which queries S3 via list_images
         $name = $class->find_free_diskname($storeid, $scfg, $vmid, $fmt);
+
+        # Also check local cache — previous allocations may not have been
+        # uploaded to S3 yet, so find_free_diskname won't see them.
+        while (-e "$imagedir/$name") {
+            if ($name =~ /^(vm-\d+-disk-)(\d+)(.*)$/) {
+                $name = $1 . ($2 + 1) . $3;
+            } else {
+                die "alloc_image: cannot find free disk name for VM $vmid\n";
+            }
+        }
     }
 
     # Create the disk image in the cache — the watcher uploads to S3
