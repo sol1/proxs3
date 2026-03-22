@@ -316,6 +316,11 @@ sub deactivate_storage {
     return 1;
 }
 
+sub check_connection {
+    my ($class, $storeid, $scfg) = @_;
+    return -S $SOCKET_PATH ? 1 : 0;
+}
+
 sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
 
@@ -420,8 +425,108 @@ sub activate_volume {
     return 1;
 }
 
+sub volume_has_feature {
+    my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running, $opts) = @_;
+
+    # S3 supports these features for images content
+    my $dominated = {
+        clone    => 1,  # same-storage full copy via S3 CopyObject
+        copy     => 1,  # cross-storage copy (activate + path + qemu-img)
+        template => 1,  # convert to base image (rename in S3)
+        rename   => 1,  # reassign disk ownership (rename in S3)
+        sparseinit => 1,
+    };
+
+    # No snapshot support — S3 has no snapshot semantics
+    return 0 if ($feature eq 'snapshot');
+
+    return $dominated->{$feature} ? 1 : 0;
+}
+
+sub create_base {
+    my ($class, $storeid, $scfg, $volname) = @_;
+
+    my ($content, $filename) = _parse_volname($volname);
+    die "create_base only works for images content\n" if $content ne 'images';
+
+    # Parse vmid and disk name: "9001/vm-9001-disk-0.raw" → base-9001-disk-0.raw
+    my ($vmid, $diskname) = $filename =~ m|^(\d+)/(.+)$|
+        or die "Invalid images volname: $filename\n";
+    my $basename = $diskname;
+    $basename =~ s/^vm-/base-/;
+
+    my $src_key = "images/$vmid/$diskname";
+    my $dst_key = "images/$vmid/$basename";
+
+    # Rename in S3 (copy + delete)
+    eval {
+        _daemon_request('/v1/rename', {
+            storage => $storeid,
+            src_key => $src_key,
+            dst_key => $dst_key,
+        });
+    };
+    die "create_base: S3 rename failed: $@\n" if $@;
+
+    return "$vmid/$basename";
+}
+
 sub clone_image {
-    die "clone not supported on S3 storage — use --target to clone to local storage\n";
+    my ($class, $scfg, $storeid, $volname, $vmid, $snap) = @_;
+
+    die "snapshots not supported on S3 storage\n" if $snap;
+
+    my ($content, $filename) = _parse_volname($volname);
+    die "clone only works for images content\n" if $content ne 'images';
+
+    my $src_key = "images/$filename";
+
+    # Allocate a new disk name for the clone
+    my $name = $class->find_free_diskname($storeid, $scfg, $vmid, 'raw');
+    my $dst_key = "images/$vmid/$name";
+
+    # Copy in S3 (keep source — this is a clone, not a move)
+    eval {
+        _daemon_request('/v1/copy', {
+            storage => $storeid,
+            src_key => $src_key,
+            dst_key => $dst_key,
+        });
+    };
+    die "clone_image: S3 copy failed: $@\n" if $@;
+
+    return "$vmid/$name";
+}
+
+sub rename_volume {
+    my ($class, $scfg, $storeid, $source_volname, $target_vmid, $target_volname) = @_;
+
+    my ($src_content, $src_filename) = _parse_volname($source_volname);
+    die "rename only works for images content\n" if $src_content ne 'images';
+
+    my $src_key = "images/$src_filename";
+
+    # Build target volname if not provided
+    if (!$target_volname) {
+        my ($src_vmid, $diskname) = $src_filename =~ m|^(\d+)/(.+)$|
+            or die "Invalid images volname: $src_filename\n";
+        $diskname =~ s/^(vm|base)-\d+/vm-$target_vmid/;
+        $target_volname = "$target_vmid/$diskname";
+    }
+
+    my ($tgt_content, $tgt_filename) = _parse_volname($target_volname);
+    my $dst_key = "images/$tgt_filename";
+
+    eval {
+        _daemon_request('/v1/rename', {
+            storage => $storeid,
+            src_key => $src_key,
+            dst_key => $dst_key,
+        });
+    };
+    die "rename_volume: S3 rename failed: $@\n" if $@;
+
+    return "$target_volname";
 }
 
 sub alloc_image {
@@ -442,10 +547,8 @@ sub alloc_image {
     ($size) = $size =~ /\A(\d+)\z/ or die "Invalid size: $size\n";
 
     if (!$name) {
-        for (my $i = 0; ; $i++) {
-            $name = "vm-$vmid-disk-$i.$fmt";
-            last if ! -e "$imagedir/$name";
-        }
+        # Use find_free_diskname which queries S3 via list_images, not just local cache
+        $name = $class->find_free_diskname($storeid, $scfg, $vmid, $fmt);
     }
 
     # Create the disk image in the cache — the watcher uploads to S3
@@ -467,6 +570,140 @@ sub free_image {
     };
     warn "proxs3: failed to delete $volname: $@\n" if $@;
     return;
+}
+
+sub list_images {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
+
+    # Query S3 instead of globbing local cache — the base class globs the
+    # filesystem which only sees cached files, missing images in S3.
+    my $list = eval {
+        _daemon_request('/v1/list', { storage => $storeid, content => 'images' });
+    };
+    return [] if $@ || !$list || ref($list) ne 'ARRAY';
+
+    my @volumes;
+    for my $vol (@$list) {
+        my $info = {
+            volid   => $vol->{volume},
+            format  => $vol->{format},
+            size    => $vol->{size},
+            content => 'images',
+        };
+        if ($vol->{volume} =~ m/^[^:]+:(\d+)\//) {
+            $info->{vmid} = $1;
+            next if defined($vmid) && $info->{vmid} != $vmid;
+        }
+        push @volumes, $info;
+    }
+    return \@volumes;
+}
+
+sub volume_size_info {
+    my ($class, $scfg, $storeid, $volname, $timeout) = @_;
+
+    my ($content, $filename) = _parse_volname($volname);
+    my $prefix = _content_to_prefix($content);
+    my $key = "${prefix}${filename}";
+
+    # Try local cache first (qemu-img info gives accurate virtual/used size)
+    my $cache_base = $_cache_dir // $DEFAULT_CACHE_DIR;
+    my $cached = "$cache_base/$storeid/$key";
+    if (-e $cached) {
+        # Untaint for exec
+        ($cached) = $cached =~ /\A([a-zA-Z0-9._\/-]+)\z/;
+        if ($cached) {
+            my $info = PVE::Storage::Plugin::file_size_info($cached, $timeout);
+            return wantarray ? ($info->{size}, $info->{format}, $info->{used}, $info->{parent}) : $info->{size}
+                if $info && $info->{size};
+        }
+    }
+
+    # Fall back to S3 metadata (HeadObject) — only gives object size, not virtual size
+    my $res = eval {
+        _daemon_request('/v1/list', { storage => $storeid, content => $content });
+    };
+    if (!$@ && $res && ref($res) eq 'ARRAY') {
+        for my $vol (@$res) {
+            if ($vol->{key} eq $key) {
+                my $format = $vol->{format} // 'raw';
+                return wantarray ? ($vol->{size}, $format, $vol->{size}, undef) : $vol->{size};
+            }
+        }
+    }
+
+    return wantarray ? (0, 'raw', 0, undef) : 0;
+}
+
+sub volume_resize {
+    die "volume resize is not supported on S3 storage\n";
+}
+
+sub prune_backups {
+    my ($class, $scfg, $storeid, $keep, $vmid, $type, $dryrun, $logfunc) = @_;
+
+    $logfunc //= sub { print @_ };
+
+    # List backup volumes from S3
+    my $list = eval {
+        _daemon_request('/v1/list', { storage => $storeid, content => 'backup' });
+    };
+    return if $@ || !$list || ref($list) ne 'ARRAY';
+
+    # Build volume list in the format PVE::Storage::prune_mark_backup_group expects
+    my @backups;
+    for my $vol (@$list) {
+        my $volid = $vol->{volume};
+        my ($sid, $volname) = $volid =~ m/^([^:]+):(.+)$/;
+        next unless $volname;
+
+        # Filter by vmid if specified
+        my $archive_info = eval { PVE::Storage::archive_info($volname) };
+        next if $@;
+        next if defined($vmid) && $archive_info->{vmid} != $vmid;
+        next if defined($type) && $archive_info->{type} ne $type;
+
+        push @backups, {
+            volid  => $volid,
+            ctime  => $archive_info->{ctime},
+            vmid   => $archive_info->{vmid},
+            type   => $archive_info->{type},
+            mark   => 'keep',
+        };
+    }
+
+    PVE::Storage::prune_mark_backup_group(\@backups, $keep);
+
+    for my $backup (@backups) {
+        my $volid = $backup->{volid};
+        my $mark = $backup->{mark};
+
+        if ($mark eq 'remove') {
+            # Prune from local cache only — S3 backups are preserved.
+            # Use S3 lifecycle policies to manage long-term retention in the bucket.
+            $logfunc->("prune cache: $volid\n");
+            if (!$dryrun) {
+                eval {
+                    my ($sid, $volname) = $volid =~ m/^([^:]+):(.+)$/;
+                    my ($content, $filename) = _parse_volname($volname);
+                    my $prefix = _content_to_prefix($content);
+                    my $key = "${prefix}${filename}";
+                    my $cache_base = $_cache_dir // $DEFAULT_CACHE_DIR;
+                    my $cached = "$cache_base/$storeid/$key";
+                    unlink $cached if -e $cached;
+                };
+                $logfunc->("  error: $@") if $@;
+            }
+        } elsif ($mark eq 'keep') {
+            $logfunc->("keep: $volid\n");
+        } elsif ($mark eq 'protected') {
+            $logfunc->("protected: $volid\n");
+        } else {
+            $logfunc->("unknown: $volid\n");
+        }
+    }
+
+    return \@backups;
 }
 
 # --- Helpers ---

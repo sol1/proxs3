@@ -125,6 +125,15 @@ func (m *mockS3Client) DeleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
+func (m *mockS3Client) CopyObject(ctx context.Context, srcKey, dstKey string) error {
+	obj, ok := m.objects[srcKey]
+	if !ok {
+		return fmt.Errorf("source key %s not found", srcKey)
+	}
+	m.objects[dstKey] = obj
+	return nil
+}
+
 // newTestServer creates a Server with a mock client for testing.
 func newTestServer(t *testing.T, mock *mockS3Client) *Server {
 	t.Helper()

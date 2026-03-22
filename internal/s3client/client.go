@@ -23,6 +23,7 @@ type S3Client interface {
 	GetObject(ctx context.Context, key string) (*GetObjectResult, error)
 	PutObject(ctx context.Context, key string, body io.Reader, size int64) error
 	DeleteObject(ctx context.Context, key string) error
+	CopyObject(ctx context.Context, srcKey, dstKey string) error
 	HeadBucket(ctx context.Context) error
 }
 
@@ -178,6 +179,19 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("deleting object %s: %w", key, err)
+	}
+	return nil
+}
+
+// CopyObject copies an object within the same bucket.
+func (c *Client) CopyObject(ctx context.Context, srcKey, dstKey string) error {
+	_, err := c.s3.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(c.bucket),
+		CopySource: aws.String(fmt.Sprintf("%s/%s", c.bucket, srcKey)),
+		Key:        aws.String(dstKey),
+	})
+	if err != nil {
+		return fmt.Errorf("copying object %s to %s: %w", srcKey, dstKey, err)
 	}
 	return nil
 }

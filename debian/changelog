@@ -1,3 +1,16 @@
+proxs3 (0.5.0-1) unstable; urgency=medium
+
+  * Implement S3-native template conversion (create_base), clone, and rename
+  * Add /v1/copy and /v1/rename daemon endpoints (S3 CopyObject)
+  * Override volume_has_feature to accurately report S3 capabilities
+  * Override list_images to query S3 instead of local cache (fixes name collisions)
+  * Override volume_size_info with cache-first, S3 metadata fallback
+  * Backup pruning removes from local cache only — S3 backups preserved
+  * Add check_connection to detect daemon availability
+  * Explicitly disable volume_resize on S3 storage
+
+ -- Dave Kempe <dave@sol1.com.au>  Sun, 22 Mar 2026 16:03:00 +1100
+
 proxs3 (0.4.5-1) unstable; urgency=medium
 
   * Include vmid in list_volumes for images content type (fixes UI delete)

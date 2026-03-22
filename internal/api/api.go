@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -118,6 +120,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/v1/download", s.handleDownload)
 	mux.HandleFunc("/v1/upload", s.handleUpload)
 	mux.HandleFunc("/v1/delete", s.handleDelete)
+	mux.HandleFunc("/v1/copy", s.handleCopy)
+	mux.HandleFunc("/v1/rename", s.handleRename)
 	mux.HandleFunc("/v1/path", s.handlePath)
 	mux.HandleFunc("/v1/config", s.handleConfig)
 
@@ -434,6 +438,78 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
+	storageID := r.URL.Query().Get("storage")
+	srcKey := r.URL.Query().Get("src_key")
+	dstKey := r.URL.Query().Get("dst_key")
+
+	client, ok := s.getClient(storageID)
+	if !ok {
+		http.Error(w, "unknown storage", http.StatusNotFound)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
+	if err := client.CopyObject(ctx, srcKey, dstKey); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// If the source is cached locally, copy the cache entry too
+	if src := s.cache.Path(storageID, srcKey); src != "" {
+		dst := s.cache.ExpectedPath(storageID, dstKey)
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err == nil {
+			if f, err := os.Open(src); err == nil {
+				if d, err := os.Create(dst); err == nil {
+					io.Copy(d, f)
+					d.Close()
+				}
+				f.Close()
+			}
+		}
+	}
+
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
+	storageID := r.URL.Query().Get("storage")
+	srcKey := r.URL.Query().Get("src_key")
+	dstKey := r.URL.Query().Get("dst_key")
+
+	client, ok := s.getClient(storageID)
+	if !ok {
+		http.Error(w, "unknown storage", http.StatusNotFound)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
+	// Copy then delete in S3 (S3 has no native rename)
+	if err := client.CopyObject(ctx, srcKey, dstKey); err != nil {
+		http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := client.DeleteObject(ctx, srcKey); err != nil {
+		log.Printf("rename: copy succeeded but delete of %s failed: %v", srcKey, err)
+	}
+
+	// Rename in local cache if present
+	src := s.cache.ExpectedPath(storageID, srcKey)
+	dst := s.cache.ExpectedPath(storageID, dstKey)
+	if _, err := os.Stat(src); err == nil {
+		clearImmutable(src)
+		os.MkdirAll(filepath.Dir(dst), 0755)
+		os.Rename(src, dst)
+	}
+	s.cache.Invalidate(storageID, srcKey)
+
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
 func (s *Server) handlePath(w http.ResponseWriter, r *http.Request) {
 	// Return the expected cache path without downloading. PVE calls path() for
 	// many operations (delete, config, template) that don't need the file on disk.
@@ -454,6 +530,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Helpers ---
+
+func clearImmutable(path string) {
+	exec.Command("chattr", "-i", path).Run()
+}
 
 func contentToPrefix(content string) string {
 	switch content {
