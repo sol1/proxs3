@@ -1,3 +1,11 @@
+proxs3 (0.4.4-1) unstable; urgency=medium
+
+  * Separate path resolution from download — /v1/path no longer triggers S3 download
+  * Handle PVE immutable flag (chattr +i) on template base images in cache
+  * Clear immutable flag during cache removal, age eviction, and LRU eviction
+
+ -- Dave Kempe <dave@sol1.com.au>  Sun, 22 Mar 2026 15:04:00 +1100
+
 proxs3 (0.4.3-1) unstable; urgency=medium
 
   * Fix alloc_image to create disk file with qemu-img create

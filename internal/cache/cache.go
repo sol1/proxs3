@@ -6,12 +6,19 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// clearImmutable removes the immutable flag (chattr -i) from a file.
+// PVE sets this on template base images. Best-effort — ignored if it fails.
+func clearImmutable(path string) {
+	exec.Command("chattr", "-i", path).Run()
+}
 
 // FileMeta tracks the S3 object metadata for a cached file,
 // so we can detect when the remote object has changed.
@@ -193,12 +200,14 @@ func (fc *FileCache) Link(storageID, key, srcPath string, meta FileMeta) {
 }
 
 // Remove deletes a cached file and its metadata.
+// Clears the immutable flag first — PVE sets chattr +i on template base images.
 func (fc *FileCache) Remove(storageID, key string) error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	p := fc.path(storageID, key)
 	os.Remove(fc.metaPath(storageID, key))
 	os.Remove(p + ".meta") // clean up legacy location
+	clearImmutable(p)
 	return os.Remove(p)
 }
 
@@ -213,6 +222,12 @@ func (fc *FileCache) SizeMB() int64 {
 		return nil
 	})
 	return total / (1024 * 1024)
+}
+
+// ExpectedPath returns where a cached file would be stored, without checking
+// if it exists. Used by the path API to answer "where would this file be?"
+func (fc *FileCache) ExpectedPath(storageID, key string) string {
+	return fc.path(storageID, key)
 }
 
 func (fc *FileCache) path(storageID, key string) string {
@@ -242,6 +257,7 @@ func (fc *FileCache) EvictByAge(storageID string, maxAge time.Duration) int {
 		}
 		if info.ModTime().Before(cutoff) {
 			fc.mu.Lock()
+			clearImmutable(path)
 			if err := os.Remove(path); err == nil {
 				removed++
 				// Clean up metadata
@@ -311,6 +327,7 @@ func (fc *FileCache) evictIfNeeded() {
 		if totalSize <= maxBytes {
 			break
 		}
+		clearImmutable(f.path)
 		if err := os.Remove(f.path); err != nil {
 			continue
 		}

@@ -435,8 +435,18 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePath(w http.ResponseWriter, r *http.Request) {
-	// Path always validates and downloads if needed — delegates to download handler
-	s.handleDownload(w, r)
+	// Return the expected cache path without downloading. PVE calls path() for
+	// many operations (delete, config, template) that don't need the file on disk.
+	// The actual download happens in activate_volume via /v1/download.
+	storageID := r.URL.Query().Get("storage")
+	key := r.URL.Query().Get("key")
+
+	if _, ok := s.getClient(storageID); !ok {
+		http.Error(w, "unknown storage", http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, map[string]string{"path": s.cache.ExpectedPath(storageID, key)})
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
