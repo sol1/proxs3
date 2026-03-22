@@ -432,12 +432,20 @@ sub alloc_image {
     my $imagedir = "$cache_base/$safe_sid/images/$vmid";
     File::Path::make_path($imagedir);
 
+    # Untaint format and size for qemu-img exec
+    ($fmt) = $fmt =~ /\A(raw|qcow2|vmdk)\z/ or die "Invalid format: $fmt\n";
+    ($size) = $size =~ /\A(\d+)\z/ or die "Invalid size: $size\n";
+
     if (!$name) {
         for (my $i = 0; ; $i++) {
             $name = "vm-$vmid-disk-$i.$fmt";
             last if ! -e "$imagedir/$name";
         }
     }
+
+    # Create the disk image in the cache — the watcher uploads to S3
+    my $path = "$imagedir/$name";
+    PVE::Tools::run_command(['/usr/bin/qemu-img', 'create', '-f', $fmt, $path, "${size}K"]);
 
     return "$vmid/$name";
 }

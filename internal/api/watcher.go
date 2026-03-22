@@ -113,6 +113,16 @@ func (s *Server) addWatchDirs(watcher *fsnotify.Watcher) {
 			dir := filepath.Join(baseDir, subDir)
 			if _, err := os.Stat(dir); err == nil {
 				_ = watcher.Add(dir)
+				// Also watch immediate subdirectories (e.g., images/9001/)
+				// fsnotify doesn't recurse, and images uses vmid subdirs
+				entries, err := os.ReadDir(dir)
+				if err == nil {
+					for _, e := range entries {
+						if e.IsDir() {
+							_ = watcher.Add(filepath.Join(dir, e.Name()))
+						}
+					}
+				}
 			}
 		}
 	}
