@@ -32,9 +32,10 @@ type S3Client interface {
 
 // Client wraps the AWS S3 client for a single storage backend.
 type Client struct {
-	s3     *s3.Client
-	bucket string
-	id     string
+	s3         *s3.Client
+	bucket     string
+	id         string
+	partSizeMB int64
 }
 
 // New creates an S3 client from a StorageConfig, with optional proxy support.
@@ -69,10 +70,16 @@ func New(cfg config.StorageConfig, proxy config.ProxyConfig) (*Client, error) {
 		HTTPClient:   httpClient,
 	})
 
+	partSizeMB := cfg.PartSizeMB
+	if partSizeMB <= 0 {
+		partSizeMB = 64 // default: 64MB (AWS SDK default)
+	}
+
 	return &Client{
-		s3:     s3Client,
-		bucket: cfg.Bucket,
-		id:     cfg.StorageID,
+		s3:         s3Client,
+		bucket:     cfg.Bucket,
+		id:         cfg.StorageID,
+		partSizeMB: partSizeMB,
 	}, nil
 }
 
@@ -157,10 +164,10 @@ func (c *Client) GetObject(ctx context.Context, key string) (*GetObjectResult, e
 }
 
 // PutObject uploads an object from a reader.
-// Uses multipart upload automatically for files larger than 64MB.
+// Uses multipart upload with part size configured via PartSizeMB (default 64MB).
 func (c *Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
 	uploader := manager.NewUploader(c.s3, func(u *manager.Uploader) {
-		u.PartSize = 64 * 1024 * 1024 // 64MB per part
+		u.PartSize = c.partSizeMB * 1024 * 1024
 		u.Concurrency = 4
 	})
 	_, err := uploader.Upload(ctx, &s3.PutObjectInput{

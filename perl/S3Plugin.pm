@@ -84,6 +84,13 @@ sub properties {
             minimum     => 0,
             optional    => 1,
         },
+        'part-size-mb' => {
+            description => "Multipart upload part size in MB (default 64). "
+                         . "MinIO requires <= 16. Set to 16 for MinIO compatibility.",
+            type        => 'integer',
+            minimum     => 5,
+            optional    => 1,
+        },
     };
 }
 
@@ -102,6 +109,7 @@ sub options {
         'max-protected-backups' => { optional => 1 },
         'prune-backups'  => { optional => 1 },
         'cache-max-age'  => { optional => 1 },
+        'part-size-mb'   => { optional => 1 },
     };
 }
 

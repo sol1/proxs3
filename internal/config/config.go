@@ -30,7 +30,8 @@ type StorageConfig struct {
 	PathStyle   bool
 	AccessKey   string
 	SecretKey   string
-	CacheMaxAge int // days; 0 = keep forever
+	CacheMaxAge int   // days; 0 = keep forever
+	PartSizeMB  int64 // multipart upload part size in MB; 0 = default (64MB)
 }
 
 // Credential holds S3 access credentials, loaded from per-storage files.
@@ -188,6 +189,10 @@ func ParseStorageCfg(path string) ([]StorageConfig, error) {
 			case "cache-max-age":
 				if days, err := strconv.Atoi(val); err == nil && days >= 0 {
 					current.CacheMaxAge = days
+				}
+			case "part-size-mb":
+				if mb, err := strconv.ParseInt(val, 10, 64); err == nil && mb > 0 {
+					current.PartSizeMB = mb
 				}
 			}
 		}

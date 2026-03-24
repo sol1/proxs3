@@ -542,6 +542,37 @@ func TestParseStorageCfg_AllFields(t *testing.T) {
 	}
 }
 
+func TestParseStorageCfg_PartSizeMB(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		expected int64
+	}{
+		{"sixteen", "16", 16},
+		{"sixty-four", "64", 64},
+		{"five minimum", "5", 5},
+		{"zero ignored", "0", 0},
+		{"negative ignored", "-1", 0},
+		{"non-numeric ignored", "abc", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			f := filepath.Join(dir, "storage.cfg")
+			os.WriteFile(f, []byte("s3: test\n\tendpoint e\n\tbucket b\n\tpart-size-mb "+tt.value+"\n"), 0644)
+
+			storages, err := ParseStorageCfg(f)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if storages[0].PartSizeMB != tt.expected {
+				t.Errorf("expected part-size-mb %d, got %d", tt.expected, storages[0].PartSizeMB)
+			}
+		})
+	}
+}
+
 // --- Credential tests ---
 
 func TestLoadCredential(t *testing.T) {

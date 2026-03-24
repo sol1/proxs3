@@ -81,6 +81,15 @@ Ext.define('PVE.storage.S3InputPanel', {
 		allowBlank: true,
 		deleteEmpty: !me.isCreate,
 	    },
+	    {
+		xtype: 'proxmoxintegerfield',
+		name: 'part-size-mb',
+		fieldLabel: 'Part Size (MB)',
+		emptyText: '64 (default)',
+		minValue: 5,
+		allowBlank: true,
+		deleteEmpty: !me.isCreate,
+	    },
 	];
 
 	me.callParent();
