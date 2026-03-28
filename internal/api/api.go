@@ -614,6 +614,9 @@ func (s *Server) mergeLocalFiles(volumes *[]VolumeInfo, localDir, prefix, conten
 	for _, entry := range entries {
 		if entry.IsDir() {
 			if content == "images" {
+				if entry.Name() == ".meta" {
+					continue
+				}
 				// Recurse into VM ID subdirectories for images
 				subDir := filepath.Join(localDir, entry.Name())
 				subEntries, err := os.ReadDir(subDir)
