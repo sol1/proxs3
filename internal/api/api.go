@@ -295,18 +295,24 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	objects, err := client.ListObjects(ctx, prefix)
 	if err != nil {
-		// S3 unreachable — return empty list rather than blocking PVE
+		// S3 unreachable — still include locally cached files rather than blocking PVE
 		log.Printf("list failed for %s/%s (S3 unreachable?): %v", storageID, content, err)
-		writeJSON(w, []VolumeInfo{})
+		var volumes []VolumeInfo
+		localDir := filepath.Join(s.cfg.CacheDir, storageID, prefix)
+		s.mergeLocalFiles(&volumes, localDir, prefix, content, storageID, nil)
+		writeJSON(w, volumes)
 		return
 	}
 
+	// Build a set of S3 keys for quick lookup
+	s3Keys := make(map[string]bool, len(objects))
 	var volumes []VolumeInfo
 	for _, obj := range objects {
 		// Skip directory markers
 		if strings.HasSuffix(obj.Key, "/") {
 			continue
 		}
+		s3Keys[obj.Key] = true
 		// images volids use "vmid/diskname" format; others use "content/filename"
 		var volname string
 		if content == "images" {
@@ -323,6 +329,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		volumes = append(volumes, vol)
 	}
+
+	// Include locally cached files not yet uploaded to S3.
+	// PVE (and Terraform providers) may write files directly to the cache
+	// directory; the watcher uploads them asynchronously. Without this,
+	// list_volumes returns empty until the upload completes.
+	localDir := filepath.Join(s.cfg.CacheDir, storageID, prefix)
+	s.mergeLocalFiles(&volumes, localDir, prefix, content, storageID, s3Keys)
 
 	writeJSON(w, volumes)
 }
@@ -587,6 +600,75 @@ func (s *Server) handlePath(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"cache_dir": s.cfg.CacheDir})
+}
+
+// mergeLocalFiles scans a local cache directory and adds any files that
+// exist locally but are not yet in S3 (pending watcher upload) to the
+// volume list. This ensures files written directly by PVE (e.g. via
+// Terraform or the upload API) appear immediately in list_volumes.
+func (s *Server) mergeLocalFiles(volumes *[]VolumeInfo, localDir, prefix, content, storageID string, s3Keys map[string]bool) {
+	entries, err := os.ReadDir(localDir)
+	if err != nil {
+		return // directory may not exist yet
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if content == "images" {
+				if entry.Name() == ".meta" {
+					continue
+				}
+				// Recurse into VM ID subdirectories for images
+				subDir := filepath.Join(localDir, entry.Name())
+				subEntries, err := os.ReadDir(subDir)
+				if err != nil {
+					continue
+				}
+				for _, subEntry := range subEntries {
+					if subEntry.IsDir() {
+						continue
+					}
+					key := prefix + entry.Name() + "/" + subEntry.Name()
+					if s3Keys[key] {
+						continue
+					}
+					info, err := subEntry.Info()
+					if err != nil {
+						continue
+					}
+					volname := entry.Name() + "/" + subEntry.Name()
+					*volumes = append(*volumes, VolumeInfo{
+						Volume:  fmt.Sprintf("%s:%s", storageID, volname),
+						Key:     key,
+						Size:    info.Size(),
+						Format:  detectFormat(key),
+						Content: content,
+					})
+				}
+			}
+			continue
+		}
+		// Skip temp and meta files
+		name := entry.Name()
+		if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".meta") {
+			continue
+		}
+		key := prefix + name
+		if s3Keys[key] {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		volname := content + "/" + name
+		*volumes = append(*volumes, VolumeInfo{
+			Volume:  fmt.Sprintf("%s:%s", storageID, volname),
+			Key:     key,
+			Size:    info.Size(),
+			Format:  detectFormat(key),
+			Content: content,
+		})
+	}
 }
 
 // --- Helpers ---

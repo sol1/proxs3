@@ -369,6 +369,117 @@ func TestHandleList_Backups(t *testing.T) {
 	}
 }
 
+func TestHandleList_IncludesLocalPendingFiles(t *testing.T) {
+	mock := newMockClient("s3test")
+	// One file already in S3
+	mock.objects["snippets/existing.yaml"] = mockObject{size: 100, etag: "\"abc\""}
+	s := newTestServer(t, mock)
+
+	// Create a local file that is NOT in S3 (simulates pending watcher upload)
+	localDir := filepath.Join(s.cfg.CacheDir, "s3test", "snippets")
+	os.MkdirAll(localDir, 0755)
+	os.WriteFile(filepath.Join(localDir, "pending.yaml"), []byte("pending data"), 0644)
+
+	req := httptest.NewRequest("GET", "/v1/list?storage=s3test&content=snippets", nil)
+	w := httptest.NewRecorder()
+	s.handleList(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var volumes []VolumeInfo
+	json.NewDecoder(w.Body).Decode(&volumes)
+
+	if len(volumes) != 2 {
+		t.Fatalf("expected 2 volumes (1 S3 + 1 local pending), got %d", len(volumes))
+	}
+
+	// Verify both files are present
+	found := map[string]bool{}
+	for _, v := range volumes {
+		found[v.Volume] = true
+	}
+	if !found["s3test:snippets/existing.yaml"] {
+		t.Error("expected S3 file 's3test:snippets/existing.yaml' in list")
+	}
+	if !found["s3test:snippets/pending.yaml"] {
+		t.Error("expected local pending file 's3test:snippets/pending.yaml' in list")
+	}
+}
+
+func TestHandleList_LocalFileNotDuplicated(t *testing.T) {
+	mock := newMockClient("s3test")
+	// File exists in both S3 and local cache
+	mock.objects["snippets/both.yaml"] = mockObject{size: 100, etag: "\"abc\""}
+	s := newTestServer(t, mock)
+
+	localDir := filepath.Join(s.cfg.CacheDir, "s3test", "snippets")
+	os.MkdirAll(localDir, 0755)
+	os.WriteFile(filepath.Join(localDir, "both.yaml"), []byte("data"), 0644)
+
+	req := httptest.NewRequest("GET", "/v1/list?storage=s3test&content=snippets", nil)
+	w := httptest.NewRecorder()
+	s.handleList(w, req)
+
+	var volumes []VolumeInfo
+	json.NewDecoder(w.Body).Decode(&volumes)
+
+	if len(volumes) != 1 {
+		t.Fatalf("expected 1 volume (no duplicates), got %d", len(volumes))
+	}
+}
+
+func TestHandleList_SkipsTmpFiles(t *testing.T) {
+	mock := newMockClient("s3test")
+	s := newTestServer(t, mock)
+
+	localDir := filepath.Join(s.cfg.CacheDir, "s3test", "snippets")
+	os.MkdirAll(localDir, 0755)
+	os.WriteFile(filepath.Join(localDir, "upload.tmp"), []byte("partial"), 0644)
+	os.WriteFile(filepath.Join(localDir, "real.yaml"), []byte("data"), 0644)
+
+	req := httptest.NewRequest("GET", "/v1/list?storage=s3test&content=snippets", nil)
+	w := httptest.NewRecorder()
+	s.handleList(w, req)
+
+	var volumes []VolumeInfo
+	json.NewDecoder(w.Body).Decode(&volumes)
+
+	if len(volumes) != 1 {
+		t.Fatalf("expected 1 volume (.tmp skipped), got %d", len(volumes))
+	}
+	if volumes[0].Volume != "s3test:snippets/real.yaml" {
+		t.Errorf("expected 's3test:snippets/real.yaml', got %q", volumes[0].Volume)
+	}
+}
+
+func TestHandleList_S3Error_ShowsLocalFiles(t *testing.T) {
+	mock := newMockClient("s3test")
+	mock.listErr = fmt.Errorf("connection refused")
+	s := newTestServer(t, mock)
+
+	// Local file exists but S3 is unreachable
+	localDir := filepath.Join(s.cfg.CacheDir, "s3test", "snippets")
+	os.MkdirAll(localDir, 0755)
+	os.WriteFile(filepath.Join(localDir, "local.yaml"), []byte("data"), 0644)
+
+	req := httptest.NewRequest("GET", "/v1/list?storage=s3test&content=snippets", nil)
+	w := httptest.NewRecorder()
+	s.handleList(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var volumes []VolumeInfo
+	json.NewDecoder(w.Body).Decode(&volumes)
+
+	if len(volumes) != 1 {
+		t.Fatalf("expected 1 local volume when S3 unreachable, got %d", len(volumes))
+	}
+}
+
 // --- Download handler tests ---
 
 func TestHandleDownload_Fresh(t *testing.T) {
