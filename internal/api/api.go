@@ -468,8 +468,20 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if err := client.CopyObject(ctx, srcKey, dstKey); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		// Source may not be in S3 yet (pending watcher upload) — upload from local cache
+		srcPath := s.cache.ExpectedPath(storageID, srcKey)
+		f, ferr := os.Open(srcPath)
+		if ferr != nil {
+			http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+		info, _ := f.Stat()
+		log.Printf("copy: source %s not in S3, uploading local copy as %s", srcKey, dstKey)
+		if uerr := client.PutObject(ctx, dstKey, f, info.Size()); uerr != nil {
+			http.Error(w, fmt.Sprintf("upload fallback failed: %v", uerr), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// If the source is cached locally, copy the cache entry too
@@ -503,13 +515,27 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	// Copy then delete in S3 (S3 has no native rename)
+	// Copy then delete in S3 (S3 has no native rename).
+	// If the source doesn't exist in S3 yet (pending watcher upload),
+	// upload the local cached copy directly under the destination key.
 	if err := client.CopyObject(ctx, srcKey, dstKey); err != nil {
-		http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-	if err := client.DeleteObject(ctx, srcKey); err != nil {
-		log.Printf("rename: copy succeeded but delete of %s failed: %v", srcKey, err)
+		srcPath := s.cache.ExpectedPath(storageID, srcKey)
+		f, ferr := os.Open(srcPath)
+		if ferr != nil {
+			http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+		info, _ := f.Stat()
+		log.Printf("rename: source %s not in S3, uploading local copy as %s", srcKey, dstKey)
+		if uerr := client.PutObject(ctx, dstKey, f, info.Size()); uerr != nil {
+			http.Error(w, fmt.Sprintf("upload fallback failed: %v", uerr), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		if err := client.DeleteObject(ctx, srcKey); err != nil {
+			log.Printf("rename: copy succeeded but delete of %s failed: %v", srcKey, err)
+		}
 	}
 
 	// Rename in local cache if present
