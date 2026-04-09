@@ -1,3 +1,30 @@
+proxs3 (0.6.5-1) unstable; urgency=medium
+
+  * Fix delete leaving stale local cache files that block re-upload (issue #11)
+  * Make chattr immutable-flag removal more robust in systemd environments
+  * Log errors when local cache removal fails during delete
+
+ -- Dave Kempe <dave@sol1.com.au>  Wed, 09 Apr 2026 12:00:00 +1000
+
+proxs3 (0.6.4-1) unstable; urgency=medium
+
+  * Fix rename/copy when source not yet in S3
+
+ -- Dave Kempe <dave@sol1.com.au>  Wed, 09 Apr 2026 09:00:00 +1000
+
+proxs3 (0.6.3-1) unstable; urgency=medium
+
+  * Add --version flag to proxs3d and fix README wget URL
+
+ -- Dave Kempe <dave@sol1.com.au>  Tue, 08 Apr 2026 09:00:00 +1000
+
+proxs3 (0.6.2-1) unstable; urgency=medium
+
+  * Merge local cache files into /v1/list for immediate visibility (PR #8)
+  * Skip .meta directory in mergeLocalFiles for images content
+
+ -- Dave Kempe <dave@sol1.com.au>  Mon, 07 Apr 2026 09:00:00 +1000
+
 proxs3 (0.6.1-1) unstable; urgency=medium
 
   * Fix import-from: download file to cache when not present (PR #6, issue #4)

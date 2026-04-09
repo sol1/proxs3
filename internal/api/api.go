@@ -447,8 +447,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Also remove from cache
-	s.cache.Remove(storageID, key)
+	// Also remove from local cache — S3 is authoritative, so we return ok
+	// even if the local removal fails, but log the error for diagnosis.
+	if err := s.cache.Remove(storageID, key); err != nil && !os.IsNotExist(err) {
+		log.Printf("delete: S3 object removed but local cache removal failed for %s/%s: %v", storageID, key, err)
+	}
 
 	writeJSON(w, map[string]string{"status": "ok"})
 }

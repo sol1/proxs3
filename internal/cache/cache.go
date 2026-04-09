@@ -15,9 +15,12 @@ import (
 )
 
 // clearImmutable removes the immutable flag (chattr -i) from a file.
-// PVE sets this on template base images. Best-effort — ignored if it fails.
+// PVE sets this on downloaded ISOs, templates, and base images.
 func clearImmutable(path string) {
-	exec.Command("chattr", "-i", path).Run()
+	if err := exec.Command("/usr/bin/chattr", "-i", path).Run(); err != nil {
+		// Fallback to PATH lookup in case /usr/bin isn't the right location
+		exec.Command("chattr", "-i", path).Run()
+	}
 }
 
 // FileMeta tracks the S3 object metadata for a cached file,
@@ -200,7 +203,7 @@ func (fc *FileCache) Link(storageID, key, srcPath string, meta FileMeta) {
 }
 
 // Remove deletes a cached file and its metadata.
-// Clears the immutable flag first — PVE sets chattr +i on template base images.
+// Clears the immutable flag first — PVE sets chattr +i on ISOs, templates, and base images.
 func (fc *FileCache) Remove(storageID, key string) error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
@@ -208,7 +211,17 @@ func (fc *FileCache) Remove(storageID, key string) error {
 	os.Remove(fc.metaPath(storageID, key))
 	os.Remove(p + ".meta") // clean up legacy location
 	clearImmutable(p)
-	return os.Remove(p)
+	err := os.Remove(p)
+	if err != nil && !os.IsNotExist(err) {
+		// Retry after a second clearImmutable attempt — the flag may have
+		// been re-set between our clear and remove (unlikely but defensive).
+		clearImmutable(p)
+		err = os.Remove(p)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("cache: failed to remove %s: %v", p, err)
+	}
+	return err
 }
 
 // SizeMB returns the current total cache size in megabytes.
