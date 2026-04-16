@@ -205,6 +205,14 @@ func (s *Server) uploadNewFile(localPath string) {
 		return
 	}
 
+	// Skip if cache metadata shows this file is already in sync with S3.
+	// Files written by handleDownload (from S3) or handleUpload (already pushed)
+	// have metadata with matching size — no need to re-upload.
+	if meta := s.cache.GetMeta(storageID, s3Key); meta != nil && meta.Size == info.Size() {
+		log.Printf("watcher: skipping %s in %s (already synced to S3)", s3Key, storageID)
+		return
+	}
+
 	log.Printf("watcher: uploading %s to s3://%s (%.1f MB)",
 		s3Key, storageID, float64(info.Size())/(1024*1024))
 

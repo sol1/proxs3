@@ -358,21 +358,26 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		if err != nil {
 			// S3 unreachable — serve stale cache rather than failing
-			log.Printf("download: S3 unreachable for %s, serving cached copy", key)
+			log.Printf("download: S3 unreachable for %s/%s, serving cached copy", storageID, key)
 			writeJSON(w, map[string]string{"path": cached})
 			return
 		}
 		if !s.cache.IsStale(storageID, key, info.ETag, info.LastModified) {
+			log.Printf("download: cache hit for %s from %s", key, storageID)
 			writeJSON(w, map[string]string{"path": cached})
 			return
 		}
 		// Stale — invalidate and re-download
+		log.Printf("download: cached copy of %s from %s is stale, re-downloading", key, storageID)
 		s.cache.Invalidate(storageID, key)
 	}
 
 	// Download from S3 (no tight timeout here — large files take time)
+	log.Printf("download: downloading %s from s3://%s", key, storageID)
+	start := time.Now()
 	result, err := client.GetObject(r.Context(), key)
 	if err != nil {
+		log.Printf("download: failed to download %s from %s: %v", key, storageID, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -386,9 +391,13 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	localPath, err := s.cache.Store(storageID, key, result.Body, meta)
 	if err != nil {
+		log.Printf("download: failed to cache %s from %s: %v", key, storageID, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("download: cached %s from s3://%s (%.1f MB, %s)",
+		key, storageID, float64(meta.Size)/(1024*1024), time.Since(start).Round(time.Millisecond))
 
 	writeJSON(w, map[string]string{"path": localPath})
 }
@@ -417,10 +426,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("upload: uploading %s to s3://%s (%.1f MB)", key, storageID, float64(info.Size())/(1024*1024))
+	start := time.Now()
+
 	if err := client.PutObject(r.Context(), key, f, info.Size()); err != nil {
+		log.Printf("upload: failed to upload %s to %s: %v", key, storageID, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("upload: uploaded %s to s3://%s (%.1f MB, %s)",
+		key, storageID, float64(info.Size())/(1024*1024), time.Since(start).Round(time.Millisecond))
 
 	// Cache the uploaded file with current metadata
 	uploadMeta := cache.FileMeta{
@@ -442,10 +458,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("delete: deleting %s from s3://%s", key, storageID)
+
 	if err := client.DeleteObject(r.Context(), key); err != nil {
+		log.Printf("delete: failed to delete %s from %s: %v", key, storageID, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("delete: deleted %s from s3://%s", key, storageID)
 
 	// Also remove from local cache — S3 is authoritative, so we return ok
 	// even if the local removal fails, but log the error for diagnosis.
@@ -467,6 +488,8 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("copy: copying %s to %s in s3://%s", srcKey, dstKey, storageID)
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
@@ -475,17 +498,22 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
 		srcPath := s.cache.ExpectedPath(storageID, srcKey)
 		f, ferr := os.Open(srcPath)
 		if ferr != nil {
+			log.Printf("copy: failed to copy %s to %s in %s: %v", srcKey, dstKey, storageID, err)
 			http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
 			return
 		}
 		defer f.Close()
 		info, _ := f.Stat()
-		log.Printf("copy: source %s not in S3, uploading local copy as %s", srcKey, dstKey)
+		log.Printf("copy: source %s not in S3, uploading local copy as %s (%.1f MB)",
+			srcKey, dstKey, float64(info.Size())/(1024*1024))
 		if uerr := client.PutObject(ctx, dstKey, f, info.Size()); uerr != nil {
+			log.Printf("copy: fallback upload of %s to %s failed: %v", srcKey, dstKey, uerr)
 			http.Error(w, fmt.Sprintf("upload fallback failed: %v", uerr), http.StatusInternalServerError)
 			return
 		}
 	}
+
+	log.Printf("copy: copied %s to %s in s3://%s", srcKey, dstKey, storageID)
 
 	// If the source is cached locally, copy the cache entry too
 	if src := s.cache.Path(storageID, srcKey); src != "" {
@@ -515,6 +543,8 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("rename: renaming %s to %s in s3://%s", srcKey, dstKey, storageID)
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
@@ -525,13 +555,16 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		srcPath := s.cache.ExpectedPath(storageID, srcKey)
 		f, ferr := os.Open(srcPath)
 		if ferr != nil {
+			log.Printf("rename: failed to rename %s to %s in %s: %v", srcKey, dstKey, storageID, err)
 			http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
 			return
 		}
 		defer f.Close()
 		info, _ := f.Stat()
-		log.Printf("rename: source %s not in S3, uploading local copy as %s", srcKey, dstKey)
+		log.Printf("rename: source %s not in S3, uploading local copy as %s (%.1f MB)",
+			srcKey, dstKey, float64(info.Size())/(1024*1024))
 		if uerr := client.PutObject(ctx, dstKey, f, info.Size()); uerr != nil {
+			log.Printf("rename: fallback upload of %s to %s failed: %v", srcKey, dstKey, uerr)
 			http.Error(w, fmt.Sprintf("upload fallback failed: %v", uerr), http.StatusInternalServerError)
 			return
 		}
@@ -540,6 +573,8 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 			log.Printf("rename: copy succeeded but delete of %s failed: %v", srcKey, err)
 		}
 	}
+
+	log.Printf("rename: renamed %s to %s in s3://%s", srcKey, dstKey, storageID)
 
 	// Rename in local cache if present
 	src := s.cache.ExpectedPath(storageID, srcKey)
@@ -605,10 +640,12 @@ func (s *Server) handleSetAttr(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := client.PutObjectTagging(ctx, key, tags); err != nil {
+		log.Printf("set-attr: failed to set %s=%q on %s in %s: %v", attr, value, key, storageID, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf("set-attr: set %s=%q on %s in s3://%s", attr, value, key, storageID)
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
