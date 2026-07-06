@@ -152,10 +152,19 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		s.cache.StoreMeta(storageID, s3Key, cache.FileMeta{
+		// Record the ETag S3 assigned so the staleness check recognizes the
+		// cached copy as current instead of re-downloading it on first access.
+		syncedMeta := cache.FileMeta{
 			Size:         size,
 			LastModified: time.Now(),
-		})
+		}
+		hCtx, hCancel := context.WithTimeout(r.Context(), 10*time.Second)
+		if head, err := client.HeadObject(hCtx, s3Key); err == nil {
+			syncedMeta.ETag = head.ETag
+			syncedMeta.LastModified = head.LastModified
+		}
+		hCancel()
+		s.cache.StoreMeta(storageID, s3Key, syncedMeta)
 		uploaded++
 		return nil
 	})

@@ -30,8 +30,28 @@ type Server struct {
 	usage    map[string]int64
 	healthMu sync.RWMutex
 	clientMu sync.RWMutex
-	listener net.Listener
-	server   *http.Server
+	// uploads tracks in-flight uploads by local path. A second trigger while
+	// an upload runs marks it for a rerun instead of being dropped, and
+	// handleDelete can cancel the in-flight transfer.
+	uploads   map[string]*uploadState
+	uploadsMu sync.Mutex
+	// uploadRequests feeds paths into the watcher's debounce queue, so
+	// uploads triggered outside fsnotify (e.g. by handleDownload) still get
+	// the stability window and in-use check before transferring.
+	uploadRequests chan string
+	// selfWrites records paths the daemon itself is about to create inside
+	// the watched cache dirs (download renames, upload links), so the watcher
+	// doesn't mistake them for new PVE writes and mark them pending upload.
+	selfWrites sync.Map
+	listener   net.Listener
+	server     *http.Server
+}
+
+// uploadState tracks one in-flight upload for dedup, rerun, and cancellation.
+type uploadState struct {
+	rerun    bool
+	canceled bool
+	cancel   context.CancelFunc
 }
 
 // New creates a new API server.
@@ -42,11 +62,13 @@ func New(cfg *config.DaemonConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:     cfg,
-		clients: make(map[string]s3client.S3Client),
-		cache:   fc,
-		health:  make(map[string]bool),
-		usage:   make(map[string]int64),
+		cfg:            cfg,
+		clients:        make(map[string]s3client.S3Client),
+		cache:          fc,
+		health:         make(map[string]bool),
+		usage:          make(map[string]int64),
+		uploads:        make(map[string]*uploadState),
+		uploadRequests: make(chan string, 1024),
 	}
 
 	if err := s.initClients(cfg); err != nil {
@@ -359,6 +381,24 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	headCancel()
 
 	if cached := s.cache.Path(storageID, key); cached != "" {
+		// Snapshot metadata before branching on the HEAD result: the watcher
+		// may finish an upload (flipping pending → synced) between the HEAD
+		// call and this read, and reading the metadata second keeps that race
+		// on the safe side (a pending verdict serves the local file).
+		meta := s.cache.GetMeta(storageID, key)
+		if meta == nil || meta.PendingUpload {
+			// The local file is authoritative: it was created or rewritten by
+			// PVE and the watcher hasn't uploaded it yet. Metadata is only
+			// written after a confirmed S3 operation, so missing metadata
+			// means the same thing. Whatever HEAD said — 404 because the
+			// object isn't on S3 yet, or 200 for a stale previous version
+			// under the same key — the local copy wins: purging or
+			// re-downloading here would destroy data that never reached S3.
+			log.Printf("download: %s/%s pending upload, serving local copy", storageID, key)
+			s.requestUpload(cached)
+			writeJSON(w, map[string]string{"path": cached})
+			return
+		}
 		if errors.Is(headErr, s3client.ErrNotFound) {
 			// Object deleted on S3 — purge stale cache and fail closed.
 			// Use Remove (not Invalidate) so the immutable flag PVE sets on
@@ -439,7 +479,11 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// The rename lands inside a watched dir; tell the watcher it's ours so it
+	// doesn't mark the freshly downloaded file as a pending PVE write.
+	s.selfWrites.Store(finalPath, time.Now())
 	if err := os.Rename(tmpPath, finalPath); err != nil {
+		s.selfWrites.Delete(finalPath)
 		os.Remove(tmpPath)
 		log.Printf("download: rename %s -> %s failed: %v", tmpPath, finalPath, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -494,11 +538,20 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	log.Printf("upload: uploaded %s to s3://%s (%.1f MB, %s)",
 		key, storageID, float64(info.Size())/(1024*1024), time.Since(start).Round(time.Millisecond))
 
-	// Cache the uploaded file with current metadata
+	// Cache the uploaded file with current metadata. Record the ETag S3
+	// assigned so the staleness check recognizes the cached copy as current
+	// instead of re-downloading it on first access.
 	uploadMeta := cache.FileMeta{
 		Size:         info.Size(),
 		LastModified: time.Now(),
 	}
+	if head, err := client.HeadObject(r.Context(), key); err == nil {
+		uploadMeta.ETag = head.ETag
+		uploadMeta.LastModified = head.LastModified
+	}
+	// Link may create the file inside a watched dir; tell the watcher it's
+	// ours so it doesn't mark the just-uploaded file as a pending PVE write.
+	s.selfWrites.Store(s.cache.ExpectedPath(storageID, key), time.Now())
 	s.cache.Link(storageID, key, localPath, uploadMeta)
 
 	writeJSON(w, map[string]string{"status": "ok"})
@@ -515,6 +568,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("delete: deleting %s from s3://%s", key, storageID)
+
+	// Abort any in-flight background upload of this file first — a PutObject
+	// completing after the DeleteObject would resurrect the object on S3.
+	s.cancelUpload(s.cache.ExpectedPath(storageID, key))
 
 	if err := client.DeleteObject(r.Context(), key); err != nil {
 		log.Printf("delete: failed to delete %s from %s: %v", key, storageID, err)

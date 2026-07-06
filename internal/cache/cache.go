@@ -30,6 +30,12 @@ type FileMeta struct {
 	LastModified time.Time `json:"last_modified"`
 	Size         int64     `json:"size"`
 	CachedAt     time.Time `json:"cached_at"`
+	// PendingUpload marks a file whose local content is authoritative: it was
+	// created or rewritten locally (by PVE) and has not been uploaded to S3
+	// yet. Such files must never be purged or overwritten from S3. The zero
+	// value means "in sync with S3", so metadata written by older versions
+	// keeps its meaning.
+	PendingUpload bool `json:"pending_upload,omitempty"`
 }
 
 // FileCache provides a local filesystem cache for S3 objects.
@@ -282,6 +288,17 @@ func (fc *FileCache) EvictByAge(storageID string, maxAge time.Duration) int {
 			return nil
 		}
 		if info.ModTime().Before(cutoff) {
+			// Never evict a file that hasn't been uploaded to S3 — the local
+			// copy is the only copy. No metadata means the same thing: the
+			// file was written locally and not yet processed. Legacy .meta
+			// sidecars are cleaned up alongside their content file as before.
+			if !strings.HasSuffix(path, ".meta") {
+				if rel, err := filepath.Rel(storageDir, path); err == nil {
+					if meta := fc.GetMeta(storageID, filepath.ToSlash(rel)); meta == nil || meta.PendingUpload {
+						return nil
+					}
+				}
+			}
 			fc.mu.Lock()
 			err := os.Remove(path)
 			if err != nil && !os.IsNotExist(err) {
@@ -345,6 +362,18 @@ func (fc *FileCache) evictIfNeeded() {
 		if info.ModTime().After(youngCutoff) {
 			protectedSize += info.Size()
 			return nil
+		}
+		// Never size-evict a file that hasn't been uploaded to S3 — the
+		// local copy is the only copy. Partial downloads under .downloads/
+		// stay evictable (they never have metadata by design).
+		if rel, err := filepath.Rel(fc.baseDir, path); err == nil {
+			parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
+			if len(parts) == 2 && parts[0] != ".downloads" {
+				if meta := fc.GetMeta(parts[0], parts[1]); meta == nil || meta.PendingUpload {
+					protectedSize += info.Size()
+					return nil
+				}
+			}
 		}
 		files = append(files, cachedFile{
 			path:    path,
