@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 // mockS3Client implements s3client.S3Client for testing.
 type mockS3Client struct {
 	id      string
+	mu      sync.Mutex            // guards objects for tests with concurrent uploads
 	objects map[string]mockObject // key -> object
 	healthy bool
 	listErr error
@@ -27,6 +29,10 @@ type mockS3Client struct {
 	getErr  error
 	putErr  error
 	delErr  error
+	// Optional hooks for concurrency tests: PutObject signals putStarted (if
+	// set), then blocks until putRelease is closed or the context is canceled.
+	putStarted chan string
+	putRelease chan struct{}
 }
 
 type mockObject struct {
@@ -53,10 +59,21 @@ func (m *mockS3Client) HeadBucket(ctx context.Context) error {
 	return nil
 }
 
+// object returns a stored object under the lock, for assertions in tests
+// that run concurrent uploads.
+func (m *mockS3Client) object(key string) (mockObject, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	obj, ok := m.objects[key]
+	return obj, ok
+}
+
 func (m *mockS3Client) ListObjects(ctx context.Context, prefix string) ([]s3client.ObjectInfo, error) {
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var objects []s3client.ObjectInfo
 	for key, obj := range m.objects {
 		if strings.HasPrefix(key, prefix) {
@@ -75,7 +92,7 @@ func (m *mockS3Client) HeadObject(ctx context.Context, key string) (*s3client.Ob
 	if m.headErr != nil {
 		return nil, m.headErr
 	}
-	obj, ok := m.objects[key]
+	obj, ok := m.object(key)
 	if !ok {
 		return nil, fmt.Errorf("not found: %s", key)
 	}
@@ -91,7 +108,7 @@ func (m *mockS3Client) GetObject(ctx context.Context, key string) (*s3client.Get
 	if m.getErr != nil {
 		return nil, m.getErr
 	}
-	obj, ok := m.objects[key]
+	obj, ok := m.object(key)
 	if !ok {
 		return nil, fmt.Errorf("not found: %s", key)
 	}
@@ -107,7 +124,7 @@ func (m *mockS3Client) DownloadToFile(ctx context.Context, key string, w io.Writ
 	if m.getErr != nil {
 		return 0, m.getErr
 	}
-	obj, ok := m.objects[key]
+	obj, ok := m.object(key)
 	if !ok {
 		return 0, fmt.Errorf("not found: %s", key)
 	}
@@ -119,7 +136,19 @@ func (m *mockS3Client) PutObject(ctx context.Context, key string, body io.Reader
 	if m.putErr != nil {
 		return m.putErr
 	}
+	if m.putStarted != nil {
+		m.putStarted <- key
+	}
+	if m.putRelease != nil {
+		select {
+		case <-m.putRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	data, _ := io.ReadAll(body)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.objects[key] = mockObject{
 		data:         string(data),
 		size:         size,
@@ -133,11 +162,15 @@ func (m *mockS3Client) DeleteObject(ctx context.Context, key string) error {
 	if m.delErr != nil {
 		return m.delErr
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.objects, key)
 	return nil
 }
 
 func (m *mockS3Client) CopyObject(ctx context.Context, srcKey, dstKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	obj, ok := m.objects[srcKey]
 	if !ok {
 		return fmt.Errorf("source key %s not found", srcKey)
@@ -172,9 +205,11 @@ func newTestServer(t *testing.T, mock *mockS3Client) *Server {
 		clients: map[string]s3client.S3Client{
 			mock.id: mock,
 		},
-		cache:  fc,
-		health: map[string]bool{mock.id: mock.healthy},
-		usage:  map[string]int64{mock.id: 0},
+		cache:          fc,
+		health:         map[string]bool{mock.id: mock.healthy},
+		usage:          map[string]int64{mock.id: 0},
+		uploads:        make(map[string]*uploadState),
+		uploadRequests: make(chan string, 1024),
 	}
 	return s
 }
@@ -643,6 +678,108 @@ func TestHandleDownload_ObjectDeletedOnS3_RemovesCache(t *testing.T) {
 	// Stale cache must be purged so it cannot be served on a later request.
 	if p := s.cache.Path("s3test", key); p != "" {
 		t.Errorf("expected stale cache removed, but Path returned %q", p)
+	}
+}
+
+func TestHandleDownload_LocalPendingUpload_ServedNotPurged(t *testing.T) {
+	mock := newMockClient("s3test")
+	// The object does not exist on S3 yet — the watcher hasn't uploaded it.
+	mock.headErr = s3client.ErrNotFound
+	s := newTestServer(t, mock)
+
+	// PVE writes files directly into the cache dir; no meta sidecar exists yet.
+	key := "template/iso/user-data-200.iso"
+	localPath := filepath.Join(s.cfg.CacheDir, "s3test", "template", "iso", "user-data-200.iso")
+	os.MkdirAll(filepath.Dir(localPath), 0755)
+	os.WriteFile(localPath, []byte("cloud-init payload"), 0644)
+
+	req := httptest.NewRequest("GET", "/v1/download?storage=s3test&key="+key, nil)
+	w := httptest.NewRecorder()
+	s.handleDownload(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200 for local file pending upload, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["path"] != localPath {
+		t.Errorf("expected local path %q, got %q", localPath, resp["path"])
+	}
+	if _, err := os.Stat(localPath); err != nil {
+		t.Errorf("expected local file to survive, stat failed: %v", err)
+	}
+
+	// The file must be queued for upload through the watcher's debounce loop.
+	select {
+	case p := <-s.uploadRequests:
+		if p != localPath {
+			t.Errorf("expected upload request for %q, got %q", localPath, p)
+		}
+	default:
+		t.Error("expected the served pending file to be queued for upload")
+	}
+}
+
+func TestHandleDownload_PendingRewrite_ServesLocalNotS3(t *testing.T) {
+	mock := newMockClient("s3test")
+	key := "template/iso/user-data-118.iso"
+	// An older version of the object still exists on S3 under the same key.
+	mock.objects[key] = mockObject{data: "old", size: 3, etag: "\"old\"", lastModified: time.Now().Add(-time.Hour)}
+	s := newTestServer(t, mock)
+
+	// PVE rewrote the file locally; the watcher marked it pending upload.
+	// The stale S3 copy must not clobber it via the staleness check.
+	localPath := filepath.Join(s.cfg.CacheDir, "s3test", "template", "iso", "user-data-118.iso")
+	os.MkdirAll(filepath.Dir(localPath), 0755)
+	os.WriteFile(localPath, []byte("new payload"), 0644)
+	s.cache.StoreMeta("s3test", key, cache.FileMeta{Size: 11, LastModified: time.Now(), PendingUpload: true})
+
+	req := httptest.NewRequest("GET", "/v1/download?storage=s3test&key="+key, nil)
+	w := httptest.NewRecorder()
+	s.handleDownload(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200 for pending rewrite, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["path"] != localPath {
+		t.Errorf("expected local path %q, got %q", localPath, resp["path"])
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil || string(data) != "new payload" {
+		t.Errorf("expected local rewrite to survive, got %q (err %v)", data, err)
+	}
+	select {
+	case <-s.uploadRequests:
+	default:
+		t.Error("expected the pending rewrite to be queued for upload")
+	}
+}
+
+func TestHandleDownload_ObjectDeletedOnS3_WatcherUploadedMeta_RemovesCache(t *testing.T) {
+	mock := newMockClient("s3test")
+	mock.headErr = s3client.ErrNotFound
+	s := newTestServer(t, mock)
+
+	// Simulate a locally created file the watcher already uploaded: content on
+	// disk plus the meta the watcher writes after PutObject (size, no ETag).
+	// With confirmed S3 provenance, a 404 means deleted on S3 → fail closed.
+	key := "template/iso/user-data-118.iso"
+	localPath := filepath.Join(s.cfg.CacheDir, "s3test", "template", "iso", "user-data-118.iso")
+	os.MkdirAll(filepath.Dir(localPath), 0755)
+	os.WriteFile(localPath, []byte("stale"), 0644)
+	s.cache.StoreMeta("s3test", key, cache.FileMeta{Size: 5, LastModified: time.Now()})
+
+	req := httptest.NewRequest("GET", "/v1/download?storage=s3test&key="+key, nil)
+	w := httptest.NewRecorder()
+	s.handleDownload(w, req)
+
+	if w.Code != 404 {
+		t.Fatalf("expected 404 when uploaded object was deleted on S3, got %d: %s", w.Code, w.Body.String())
+	}
+	if p := s.cache.Path("s3test", key); p != "" {
+		t.Errorf("expected cache purged, but Path returned %q", p)
 	}
 }
 

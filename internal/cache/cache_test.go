@@ -731,3 +731,66 @@ func TestMultipleStorages(t *testing.T) {
 		t.Errorf("unexpected content for storage-b: %s", contentB)
 	}
 }
+
+func TestEvictByAge_SkipsPendingUpload(t *testing.T) {
+	dir := t.TempDir()
+	fc, err := New(dir, 100)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour)
+
+	// Old file with a pending-upload marker - the only copy, must survive.
+	fc.Store("s", "iso/pending.iso", strings.NewReader("aaaaa"), FileMeta{Size: 5, PendingUpload: true})
+	os.Chtimes(fc.path("s", "iso/pending.iso"), tenDaysAgo, tenDaysAgo)
+
+	// Old file with no metadata - written locally, never processed; must survive.
+	orphan := fc.path("s", "iso/orphan.iso")
+	os.MkdirAll(filepath.Dir(orphan), 0755)
+	os.WriteFile(orphan, []byte("bbbbb"), 0644)
+	os.Chtimes(orphan, tenDaysAgo, tenDaysAgo)
+
+	// Old file confirmed on S3 - evictable.
+	fc.Store("s", "iso/synced.iso", strings.NewReader("ccccc"), FileMeta{Size: 5, ETag: "\"e\""})
+	os.Chtimes(fc.path("s", "iso/synced.iso"), tenDaysAgo, tenDaysAgo)
+
+	removed := fc.EvictByAge("s", 7*24*time.Hour)
+	if removed != 1 {
+		t.Errorf("expected 1 file removed, got %d", removed)
+	}
+	if !fc.Has("s", "iso/pending.iso") {
+		t.Error("pending-upload file must not be age-evicted")
+	}
+	if !fc.Has("s", "iso/orphan.iso") {
+		t.Error("metadata-less file must not be age-evicted")
+	}
+	if fc.Has("s", "iso/synced.iso") {
+		t.Error("expected synced file to be age-evicted")
+	}
+}
+
+func TestEviction_SkipsPendingUpload(t *testing.T) {
+	dir := t.TempDir()
+	fc, err := New(dir, 1) // 1 MB cap
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	old := time.Now().Add(-2 * time.Hour) // well past evictMinAge
+
+	fc.Store("s", "dump/pending.vma", bytes.NewReader(make([]byte, 800*1024)), FileMeta{Size: 800 * 1024, PendingUpload: true})
+	os.Chtimes(fc.path("s", "dump/pending.vma"), old, old)
+
+	fc.Store("s", "dump/synced.vma", bytes.NewReader(make([]byte, 800*1024)), FileMeta{Size: 800 * 1024, ETag: "\"e\""})
+	os.Chtimes(fc.path("s", "dump/synced.vma"), old, old)
+
+	fc.evictIfNeeded()
+
+	if !fc.Has("s", "dump/pending.vma") {
+		t.Error("pending-upload file must not be size-evicted")
+	}
+	if fc.Has("s", "dump/synced.vma") {
+		t.Error("expected synced file to be size-evicted")
+	}
+}

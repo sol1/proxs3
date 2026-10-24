@@ -41,14 +41,37 @@ func (s *Server) watchCacheDirs() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
+		// Files written while the daemon wasn't running have no fsnotify
+		// event; queue anything on disk that isn't confirmed uploaded so
+		// pending uploads survive restarts.
+		s.scanPendingUploads(pending)
+
 		for {
 			select {
 			case event, ok := <-watcher.Events:
 				if !ok {
 					return
 				}
-				if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
-					pending[event.Name] = time.Now()
+				if event.Op&(fsnotify.Create|fsnotify.Write) == 0 {
+					continue
+				}
+				if s.consumeSelfWrite(event.Name) {
+					// Our own download rename or upload link — already synced.
+					continue
+				}
+				if _, seen := pending[event.Name]; !seen {
+					// New pending episode: durably mark the local file as
+					// authoritative before anything can act on the old state.
+					s.markPendingUpload(event.Name)
+				}
+				pending[event.Name] = time.Now()
+
+			case path := <-s.uploadRequests:
+				// Upload requested outside fsnotify (e.g. handleDownload
+				// served a pending file). Runs through the same debounce
+				// and in-use checks as watcher-detected writes.
+				if _, seen := pending[path]; !seen {
+					pending[path] = time.Now()
 				}
 
 			case err, ok := <-watcher.Errors:
@@ -160,31 +183,159 @@ func fileInUse(path string) bool {
 	return false
 }
 
-// uploadNewFile detects the storage ID and S3 key from a local cache path
-// and uploads the file to S3.
+// cacheRelKey maps a path inside the cache dir to its storage ID and S3 key.
+// Parses: /var/cache/proxs3/<storageID>/<prefix>/<filename>
+func (s *Server) cacheRelKey(localPath string) (storageID, s3Key string, ok bool) {
+	rel, err := filepath.Rel(s.cfg.CacheDir, localPath)
+	if err != nil {
+		return "", "", false
+	}
+	// rel is like "s3test/template/iso/debian.iso"
+	parts := strings.SplitN(rel, string(os.PathSeparator), 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	// Normalize path separators to forward slashes for S3
+	return parts[0], filepath.ToSlash(parts[1]), true
+}
+
+// consumeSelfWrite reports whether the daemon itself just created this path
+// (download rename, upload link). Entries expire so a stale one can't
+// swallow a later genuine PVE write event for the same path.
+func (s *Server) consumeSelfWrite(path string) bool {
+	v, ok := s.selfWrites.LoadAndDelete(path)
+	if !ok {
+		return false
+	}
+	return time.Since(v.(time.Time)) < 10*time.Second
+}
+
+// markPendingUpload durably marks a file PVE just wrote into the cache dir,
+// so the local copy is treated as authoritative — by handleDownload, by
+// eviction, and across daemon restarts — until the upload completes.
+func (s *Server) markPendingUpload(localPath string) {
+	if strings.HasSuffix(localPath, ".tmp") || strings.HasSuffix(localPath, ".meta") {
+		return
+	}
+	info, err := os.Stat(localPath)
+	if err != nil || info.IsDir() {
+		return
+	}
+	storageID, s3Key, ok := s.cacheRelKey(localPath)
+	if !ok {
+		return
+	}
+	s.cache.StoreMeta(storageID, s3Key, cache.FileMeta{
+		Size:          info.Size(),
+		LastModified:  info.ModTime(),
+		PendingUpload: true,
+	})
+}
+
+// scanPendingUploads walks the storage cache trees and queues files that are
+// not confirmed uploaded to S3: no metadata (written locally, never
+// processed) or an explicit pending-upload marker. fsnotify alone can't see
+// files written while the daemon wasn't running.
+func (s *Server) scanPendingUploads(pending map[string]time.Time) {
+	s.clientMu.RLock()
+	storages := make([]string, 0, len(s.clients))
+	for id := range s.clients {
+		storages = append(storages, id)
+	}
+	s.clientMu.RUnlock()
+
+	for _, storageID := range storages {
+		baseDir := filepath.Join(s.cfg.CacheDir, storageID)
+		filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(path, ".tmp") || strings.HasSuffix(path, ".meta") {
+				return nil
+			}
+			rel, err := filepath.Rel(baseDir, path)
+			if err != nil {
+				return nil
+			}
+			s3Key := filepath.ToSlash(rel)
+			if meta := s.cache.GetMeta(storageID, s3Key); meta == nil || meta.PendingUpload {
+				log.Printf("watcher: %s/%s not confirmed on S3, queueing upload", storageID, s3Key)
+				pending[path] = time.Now()
+			}
+			return nil
+		})
+	}
+}
+
+// requestUpload queues a file for upload via the watcher's debounce loop, so
+// it gets the same stability window and in-use check as fsnotify-detected
+// writes. Non-blocking: if the queue is full (or the watcher isn't running),
+// the file is still safe — it stays marked pending and the restart scan or
+// the next write event picks it up.
+func (s *Server) requestUpload(localPath string) {
+	select {
+	case s.uploadRequests <- localPath:
+	default:
+		log.Printf("watcher: upload queue full, dropping request for %s", localPath)
+	}
+}
+
+// cancelUpload aborts any in-flight background upload for localPath and
+// suppresses a queued rerun. Used by delete so a PutObject completing after
+// the DeleteObject can't resurrect a just-deleted object.
+func (s *Server) cancelUpload(localPath string) {
+	s.uploadsMu.Lock()
+	defer s.uploadsMu.Unlock()
+	if st := s.uploads[localPath]; st != nil {
+		st.canceled = true
+		st.rerun = false
+		if st.cancel != nil {
+			st.cancel()
+		}
+	}
+}
+
+// uploadNewFile uploads a local cache file to S3, deduplicating concurrent
+// triggers. A trigger that arrives while an upload is already running (e.g.
+// the file was rewritten mid-transfer) schedules a rerun after it finishes
+// instead of being dropped.
 func (s *Server) uploadNewFile(localPath string) {
 	// Skip .meta sidecar files — these are cache metadata, not real content
 	if strings.HasSuffix(localPath, ".meta") {
 		return
 	}
 
-	// Parse: /var/cache/proxs3/<storageID>/<prefix>/<filename>
-	rel, err := filepath.Rel(s.cfg.CacheDir, localPath)
-	if err != nil {
-		log.Printf("watcher: can't determine relative path for %s: %v", localPath, err)
+	s.uploadsMu.Lock()
+	if st := s.uploads[localPath]; st != nil {
+		st.rerun = true
+		s.uploadsMu.Unlock()
 		return
 	}
+	st := &uploadState{}
+	s.uploads[localPath] = st
+	s.uploadsMu.Unlock()
 
-	// rel is like "s3test/template/iso/debian.iso"
-	parts := strings.SplitN(rel, string(os.PathSeparator), 2)
-	if len(parts) != 2 {
+	for {
+		s.uploadOnce(localPath, st)
+
+		s.uploadsMu.Lock()
+		if st.rerun && !st.canceled {
+			st.rerun = false
+			s.uploadsMu.Unlock()
+			continue
+		}
+		delete(s.uploads, localPath)
+		s.uploadsMu.Unlock()
 		return
 	}
-	storageID := parts[0]
-	s3Key := parts[1]
+}
 
-	// Normalize path separators to forward slashes for S3
-	s3Key = filepath.ToSlash(s3Key)
+// uploadOnce performs a single upload attempt for uploadNewFile.
+func (s *Server) uploadOnce(localPath string, st *uploadState) {
+	storageID, s3Key, ok := s.cacheRelKey(localPath)
+	if !ok {
+		return
+	}
 
 	client, ok := s.getClient(storageID)
 	if !ok {
@@ -206,9 +357,9 @@ func (s *Server) uploadNewFile(localPath string) {
 	}
 
 	// Skip if cache metadata shows this file is already in sync with S3.
-	// Files written by handleDownload (from S3) or handleUpload (already pushed)
-	// have metadata with matching size — no need to re-upload.
-	if meta := s.cache.GetMeta(storageID, s3Key); meta != nil && meta.Size == info.Size() {
+	// Files written by handleDownload (from S3) or handleUpload (already
+	// pushed) have non-pending metadata with matching size.
+	if meta := s.cache.GetMeta(storageID, s3Key); meta != nil && !meta.PendingUpload && meta.Size == info.Size() {
 		log.Printf("watcher: skipping %s in %s (already synced to S3)", s3Key, storageID)
 		return
 	}
@@ -218,16 +369,37 @@ func (s *Server) uploadNewFile(localPath string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
+	s.uploadsMu.Lock()
+	if st.canceled {
+		s.uploadsMu.Unlock()
+		return
+	}
+	st.cancel = cancel
+	s.uploadsMu.Unlock()
 
 	if err := client.PutObject(ctx, s3Key, f, info.Size()); err != nil {
 		log.Printf("watcher: upload failed for %s: %v", s3Key, err)
 		return
 	}
 
-	// Update cache metadata
+	s.uploadsMu.Lock()
+	canceled := st.canceled
+	s.uploadsMu.Unlock()
+	if canceled {
+		// Deleted while the last bytes were in flight — don't write metadata
+		// for a file delete is about to remove.
+		return
+	}
+
+	// Update cache metadata; record the ETag S3 assigned so the staleness
+	// check recognizes the cached copy as current instead of re-downloading.
 	meta := cache.FileMeta{
 		Size:         info.Size(),
 		LastModified: time.Now(),
+	}
+	if head, err := client.HeadObject(ctx, s3Key); err == nil {
+		meta.ETag = head.ETag
+		meta.LastModified = head.LastModified
 	}
 	s.cache.StoreMeta(storageID, s3Key, meta)
 
