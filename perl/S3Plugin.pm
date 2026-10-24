@@ -30,8 +30,12 @@ my $_cache_dir;
 #   v13: activate_volume/map_volume gained $hints; on_update_hook_full (we accept
 #        $hints in activate_volume; on_update_hook still used)
 #   v14: get_identity() (optional, base dies — N/A for an object store)
+#   v15: volume_resize gained $snapname; volume_snapshot_info gained
+#        virtual-size (N/A — we die on resize and have no snapshots)
+#   v16: volname_for_format() and friends, only called from the base
+#        alloc_image/rename_volume (N/A — we override both without calling base)
 use constant APIVERSION_MIN => 11;
-use constant APIVERSION_MAX => 14;
+use constant APIVERSION_MAX => 16;
 
 sub api {
     my $apiver = eval { PVE::Storage::APIVER() };

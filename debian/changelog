@@ -1,3 +1,15 @@
+proxs3 (0.7.1-1) unstable; urgency=medium
+
+  * Raise the validated PVE storage API range to 11..16 (issue #16). PVE 9.2
+    with libpve-storage-perl 9.1.6+ is APIVER 15, so api() was clamping to
+    14 and PVE logged "implementing an older storage API" on every load.
+    No code changes needed: v15 only touches volume_resize and
+    volume_snapshot_info (we have no resize or snapshots), and v16's new
+    format helpers are only used by the base alloc_image/rename_volume,
+    which we override.
+
+ -- Dave Kempe <dave@sol1.com.au>  Sun, 25 Oct 2026 12:00:00 +1100
+
 proxs3 (0.7.0-1) unstable; urgency=medium
 
   * Fix deleted-on-S3 objects being served from cache indefinitely
