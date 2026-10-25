@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -70,6 +71,7 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	stopped := make(chan struct{})
 
 	go func() {
 		for sig := range sigCh {
@@ -88,15 +90,26 @@ func main() {
 				log.Printf("Reloaded: %d storage(s)", len(newCfg.Storages))
 			case syscall.SIGINT, syscall.SIGTERM:
 				log.Println("Shutting down...")
-				srv.Stop()
+				if err := srv.Stop(); err != nil {
+					log.Printf("Shutdown: %v", err)
+				}
+				close(stopped)
 				return
 			}
 		}
 	}()
 
-	if err := srv.Start(); err != nil {
-		log.Fatalf("Server error: %v", err)
+	// Start returns ErrServerClosed as soon as shutdown begins; wait for
+	// Stop to finish draining requests, then exit 0 so systemd sees a clean
+	// stop. Interrupted background uploads stay marked pending and resume
+	// from the startup scan.
+	if err := srv.Start(); !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("Server error: %v", err)
+		os.Remove(pidFile)
+		os.Exit(1)
 	}
+	<-stopped
+	log.Println("Stopped")
 }
 
 // runResync connects to the running daemon's Unix socket, calls /v1/resync,

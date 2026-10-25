@@ -40,6 +40,10 @@ proxs3 (0.7.1-1) unstable; urgency=medium
     pending) so the leftover isn't re-uploaded.
   * Uploads and S3 copies take the ETag from the response instead of a
     separate HeadObject call.
+  * Fix proxs3d exiting with status 1 on every stop or restart. A normal
+    shutdown was treated as a server error, so systemd logged a failure,
+    in-flight requests weren't given time to drain, and the PID file was
+    left behind. It now waits for shutdown to finish and exits 0.
 
  -- Dave Kempe <dave@sol1.com.au>  Sun, 25 Oct 2026 12:00:00 +1100
 
