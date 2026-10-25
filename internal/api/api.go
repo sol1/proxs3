@@ -38,9 +38,10 @@ type Server struct {
 	// upload of it starts while it's non-zero.
 	blocked map[string]int
 	// retries counts consecutive failed uploads per path, for backoff.
-	retries   map[string]int
-	retryBase time.Duration
-	uploadsMu sync.Mutex
+	retries     map[string]int
+	retryTimers map[string]*time.Timer
+	retryBase   time.Duration
+	uploadsMu   sync.Mutex
 	// uploadRequests feeds paths into the watcher's debounce queue, so
 	// uploads triggered outside fsnotify (e.g. by handleDownload) still get
 	// the stability window and in-use check before transferring.
@@ -73,6 +74,7 @@ func New(cfg *config.DaemonConfig) (*Server, error) {
 		uploads:        make(map[string]*uploadState),
 		blocked:        make(map[string]int),
 		retries:        make(map[string]int),
+		retryTimers:    make(map[string]*time.Timer),
 		retryBase:      time.Minute,
 		uploadRequests: make(chan string, 1024),
 	}
@@ -621,54 +623,52 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	defer s.blockUploads(s.cache.ExpectedPath(storageID, dstKey))()
+	src := s.cache.ExpectedPath(storageID, srcKey)
+	dst := s.cache.ExpectedPath(storageID, dstKey)
+	defer s.blockUploads(dst)()
+	srcCached := s.cache.Path(storageID, srcKey) != ""
 
-	dstETag := ""
-	if err := client.CopyObject(ctx, srcKey, dstKey); err != nil {
-		// Source may not be in S3 yet (pending watcher upload) — upload from local cache
-		srcPath := s.cache.ExpectedPath(storageID, srcKey)
-		f, ferr := os.Open(srcPath)
-		if ferr != nil {
+	if !s.localAuthoritative(storageID, srcKey) {
+		etag, err := client.CopyObject(ctx, srcKey, dstKey)
+		if err == nil {
+			// If the source is cached locally, copy the cache entry too
+			if srcCached {
+				if err := copyLocalFile(src, dst); err == nil {
+					if info, err := os.Stat(dst); err == nil {
+						s.recordOwnWrite(storageID, dstKey, info, etag)
+					}
+				}
+			}
+			log.Printf("copy: copied %s to %s in s3://%s", srcKey, dstKey, storageID)
+			writeJSON(w, map[string]string{"status": "ok"})
+			return
+		}
+		if !srcCached {
 			log.Printf("copy: failed to copy %s to %s in %s: %v", srcKey, dstKey, storageID, err)
 			http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
 			return
 		}
-		defer f.Close()
-		info, _ := f.Stat()
-		log.Printf("copy: source %s not in S3, uploading local copy as %s (%.1f MB)",
-			srcKey, dstKey, float64(info.Size())/(1024*1024))
-		etag, uerr := client.PutObject(ctx, dstKey, f, info.Size())
-		if uerr != nil {
-			log.Printf("copy: fallback upload of %s to %s failed: %v", srcKey, dstKey, uerr)
-			http.Error(w, fmt.Sprintf("upload fallback failed: %v", uerr), http.StatusInternalServerError)
-			return
-		}
-		dstETag = etag
+		log.Printf("copy: S3 copy of %s failed (%v), uploading local copy", srcKey, err)
 	}
 
-	log.Printf("copy: copied %s to %s in s3://%s", srcKey, dstKey, storageID)
-
-	// If the source is cached locally, copy the cache entry too
-	if src := s.cache.Path(storageID, srcKey); src != "" {
-		dst := s.cache.ExpectedPath(storageID, dstKey)
-		if err := os.MkdirAll(filepath.Dir(dst), 0755); err == nil {
-			if f, err := os.Open(src); err == nil {
-				if d, err := os.Create(dst); err == nil {
-					_, cerr := io.Copy(d, f)
-					if err := d.Close(); cerr == nil {
-						cerr = err
-					}
-					if cerr == nil {
-						s.storeSyncedMeta(ctx, client, storageID, dstKey, dst, dstETag)
-					} else {
-						os.Remove(dst)
-					}
-				}
-				f.Close()
-			}
-		}
+	// The local source has content S3 may not (pending upload), or S3 copy
+	// failed: make the local destination first and upload those exact bytes,
+	// so the cache entry and the S3 object can't differ.
+	if err := copyLocalFile(src, dst); err != nil {
+		log.Printf("copy: local copy of %s to %s failed: %v", src, dst, err)
+		http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
+		return
 	}
+	etag, info, err := putFile(ctx, client, dstKey, dst)
+	if err != nil {
+		s.cache.Invalidate(storageID, dstKey)
+		log.Printf("copy: upload of %s as %s failed: %v", srcKey, dstKey, err)
+		http.Error(w, fmt.Sprintf("upload failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	s.recordOwnWrite(storageID, dstKey, info, etag)
 
+	log.Printf("copy: copied local %s to %s in s3://%s", srcKey, dstKey, storageID)
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
@@ -694,43 +694,49 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 	dst := s.cache.ExpectedPath(storageID, dstKey)
 	defer s.blockUploads(src)()
 	defer s.blockUploads(dst)()
-	dstETag := ""
+	srcCached := s.cache.Path(storageID, srcKey) != ""
 
-	// Copy then delete in S3 (S3 has no native rename).
-	// If the source doesn't exist in S3 yet (pending watcher upload),
-	// upload the local cached copy directly under the destination key.
-	if err := client.CopyObject(ctx, srcKey, dstKey); err != nil {
-		f, ferr := os.Open(src)
-		if ferr != nil {
-			log.Printf("rename: failed to rename %s to %s in %s: %v", srcKey, dstKey, storageID, err)
-			http.Error(w, fmt.Sprintf("copy failed: %v", err), http.StatusInternalServerError)
+	// Copy then delete in S3 (S3 has no native rename). If the local copy
+	// has content S3 may not (pending upload), or the S3 copy fails, upload
+	// the local file under the destination key instead.
+	var etag string
+	var uploaded os.FileInfo // set when dst on S3 came from the local file
+	var copyErr error
+	local := s.localAuthoritative(storageID, srcKey)
+	if !local {
+		etag, copyErr = client.CopyObject(ctx, srcKey, dstKey)
+	}
+	if local || copyErr != nil {
+		if !srcCached {
+			log.Printf("rename: failed to rename %s to %s in %s: %v", srcKey, dstKey, storageID, copyErr)
+			http.Error(w, fmt.Sprintf("copy failed: %v", copyErr), http.StatusInternalServerError)
 			return
 		}
-		defer f.Close()
-		info, _ := f.Stat()
-		log.Printf("rename: source %s not in S3, uploading local copy as %s (%.1f MB)",
-			srcKey, dstKey, float64(info.Size())/(1024*1024))
-		etag, uerr := client.PutObject(ctx, dstKey, f, info.Size())
-		if uerr != nil {
-			log.Printf("rename: fallback upload of %s to %s failed: %v", srcKey, dstKey, uerr)
-			http.Error(w, fmt.Sprintf("upload fallback failed: %v", uerr), http.StatusInternalServerError)
+		var err error
+		etag, uploaded, err = putFile(ctx, client, dstKey, src)
+		if err != nil {
+			log.Printf("rename: upload of local %s as %s failed: %v", srcKey, dstKey, err)
+			http.Error(w, fmt.Sprintf("upload failed: %v", err), http.StatusInternalServerError)
 			return
 		}
-		dstETag = etag
-	} else {
-		if err := client.DeleteObject(ctx, srcKey); err != nil {
-			log.Printf("rename: copy succeeded but delete of %s failed: %v", srcKey, err)
-		}
+	}
+	if err := client.DeleteObject(ctx, srcKey); err != nil && !errors.Is(err, s3client.ErrNotFound) {
+		log.Printf("rename: %s created but delete of %s failed: %v", dstKey, srcKey, err)
 	}
 
 	log.Printf("rename: renamed %s to %s in s3://%s", srcKey, dstKey, storageID)
 
 	// Rename in local cache if present
-	if _, err := os.Stat(src); err == nil {
+	if srcCached {
 		clearImmutable(src)
 		os.MkdirAll(filepath.Dir(dst), 0755)
 		if err := os.Rename(src, dst); err == nil {
-			s.storeSyncedMeta(ctx, client, storageID, dstKey, dst, dstETag)
+			if uploaded == nil {
+				uploaded, _ = os.Stat(dst)
+			}
+			if uploaded != nil {
+				s.recordOwnWrite(storageID, dstKey, uploaded, etag)
+			}
 		}
 	}
 	s.cache.Invalidate(storageID, srcKey)
@@ -738,27 +744,69 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
-// storeSyncedMeta records a cache file the daemon just created for a key that
-// is already on S3 (copy/rename destination), so the watcher and download
-// don't mistake it for a pending PVE write. etag is from our own PutObject if
-// we have it; otherwise S3 is asked, and without an answer the entry is left
-// ETag-less so the next access re-checks it against S3.
-func (s *Server) storeSyncedMeta(ctx context.Context, client s3client.S3Client, storageID, key, path, etag string) {
-	started := time.Now()
-	info, err := os.Stat(path)
+// localAuthoritative reports whether the cached copy of key may hold content
+// S3 doesn't have: pending upload, or no metadata to say otherwise.
+func (s *Server) localAuthoritative(storageID, key string) bool {
+	if s.cache.Path(storageID, key) == "" {
+		return false
+	}
+	meta := s.cache.GetMeta(storageID, key)
+	return meta == nil || meta.PendingUpload
+}
+
+// putFile uploads the file at path as key, returning the ETag and the file's
+// state as uploaded.
+func putFile(ctx context.Context, client s3client.S3Client, key, path string) (string, os.FileInfo, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return
+		return "", nil, err
 	}
-	meta := cache.FileMeta{ETag: etag, LastModified: time.Now(), Size: info.Size()}
-	if etag == "" {
-		headCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if head, err := client.HeadObject(headCtx, key); err == nil && head.Size == info.Size() {
-			meta.ETag = head.ETag
-			meta.LastModified = head.LastModified
-		}
-		cancel()
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", nil, err
 	}
-	s.cache.MarkSynced(storageID, key, info, started, meta)
+	log.Printf("upload: uploading %s as %s (%.1f MB)", path, key, float64(info.Size())/(1024*1024))
+	etag, err := client.PutObject(ctx, key, f, info.Size())
+	return etag, info, err
+}
+
+// copyLocalFile copies src to dst, replacing dst.
+func copyLocalFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	clearImmutable(dst)
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	_, cerr := io.Copy(out, in)
+	if err := out.Close(); cerr == nil {
+		cerr = err
+	}
+	if cerr != nil {
+		os.Remove(dst)
+	}
+	return cerr
+}
+
+// recordOwnWrite records a cache file the daemon itself just created for a
+// key now on S3 (copy/rename destination) as synced, provided it is still the
+// file described by info, so the watcher and download don't mistake it for
+// a pending PVE write. Without an ETag the entry is re-checked against S3 on
+// next access.
+func (s *Server) recordOwnWrite(storageID, key string, info os.FileInfo, etag string) {
+	s.cache.MarkSynced(storageID, key, info, time.Time{}, cache.FileMeta{
+		ETag:         etag,
+		LastModified: time.Now(),
+		Size:         info.Size(),
+	})
 }
 
 func (s *Server) handleGetAttr(w http.ResponseWriter, r *http.Request) {

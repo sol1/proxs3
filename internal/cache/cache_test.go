@@ -873,3 +873,64 @@ func TestRemove_KeepsMetaWhenFileRemovalFails(t *testing.T) {
 		t.Errorf("expected synced meta kept, got %+v", meta)
 	}
 }
+
+func TestMarkSynced_OwnWriteOverridesWatcherMark(t *testing.T) {
+	fc, _ := New(t.TempDir(), 100)
+	key := "images/100/vm-100-disk-0.raw"
+	p := fc.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("disk"), 0644) // daemon's copy destination
+	info, _ := os.Stat(p)
+	fc.MarkPending("s3test", key) // watcher saw the Create first
+
+	if !fc.MarkSynced("s3test", key, info, time.Time{}, FileMeta{ETag: "\"d\"", Size: 4}) {
+		t.Fatal("expected the daemon's own write to be recorded as synced")
+	}
+	if fc.MarkPending("s3test", key) {
+		t.Error("expected later watcher events to be ignored")
+	}
+}
+
+func TestMarkPending_ReplacedFileWithOldMtime(t *testing.T) {
+	fc, _ := New(t.TempDir(), 100)
+	key := "snippets/user.yaml"
+	p := fc.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("v1"), 0644)
+	fc.StoreMeta("s3test", key, FileMeta{ETag: "\"a\"", Size: 2})
+
+	// Same-size file moved in over it, carrying an old mtime (mv, cp -p).
+	tmp := p + ".new"
+	os.WriteFile(tmp, []byte("v2"), 0644)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(tmp, old, old)
+	os.Rename(tmp, p)
+
+	if !fc.MarkPending("s3test", key) {
+		t.Error("expected a replaced file to be marked pending despite its old mtime")
+	}
+}
+
+func TestRemove_FailureClearsPendingFlag(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	fc, _ := New(t.TempDir(), 100)
+	key := "snippets/user.yaml"
+	p := fc.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("data"), 0644)
+	fc.MarkPending("s3test", key)
+
+	os.Chmod(filepath.Dir(p), 0555)
+	defer os.Chmod(filepath.Dir(p), 0755)
+	fc.Remove("s3test", key)
+
+	meta := fc.GetMeta("s3test", key)
+	if meta == nil || meta.PendingUpload {
+		t.Fatalf("expected non-pending meta after failed remove, got %+v", meta)
+	}
+	if fc.MarkPending("s3test", key) {
+		t.Error("leftover of a deleted file would be re-uploaded")
+	}
+}

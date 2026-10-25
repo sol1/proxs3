@@ -316,7 +316,11 @@ func (s *Server) uploadNewFile(localPath string) {
 
 	s.uploadsMu.Lock()
 	if s.blocked[localPath] > 0 {
+		// Delete/rename got in after the watcher's check. Hand it back to
+		// the watcher, which waits for the block to lift and then drops it
+		// if the file is gone.
 		s.uploadsMu.Unlock()
+		s.requestUpload(localPath)
 		return
 	}
 	if st := s.uploads[localPath]; st != nil {
@@ -342,6 +346,10 @@ func (s *Server) uploadNewFile(localPath string) {
 			s.scheduleRetryLocked(localPath)
 		} else {
 			delete(s.retries, localPath)
+			if t := s.retryTimers[localPath]; t != nil {
+				t.Stop()
+				delete(s.retryTimers, localPath)
+			}
 		}
 		close(st.done)
 		s.uploadsMu.Unlock()
@@ -363,7 +371,22 @@ func (s *Server) scheduleRetryLocked(localPath string) {
 		delay = 30 * time.Minute
 	}
 	log.Printf("watcher: retrying upload of %s in %s", localPath, delay)
-	time.AfterFunc(delay, func() { s.requestUpload(localPath) })
+	// One timer per path: failures from extra triggers during an outage
+	// push the retry back rather than starting parallel retry chains.
+	if t := s.retryTimers[localPath]; t != nil {
+		t.Reset(delay)
+		return
+	}
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
+		s.uploadsMu.Lock()
+		if s.retryTimers[localPath] == t {
+			delete(s.retryTimers, localPath)
+		}
+		s.uploadsMu.Unlock()
+		s.requestUpload(localPath)
+	})
+	s.retryTimers[localPath] = t
 }
 
 // uploadOnce performs a single upload attempt for uploadNewFile. Returns true
@@ -441,7 +464,7 @@ func (s *Server) uploadOnce(localPath string, st *uploadState) (retry bool) {
 		// mustn't count as a rewrite against this upload.
 		s.cache.MarkPending(storageID, s3Key)
 		started = time.Now()
-	case !meta.PendingUpload && meta.Size == info.Size() && !info.ModTime().After(meta.CachedAt):
+	case meta.Covers(info):
 		// Metadata recorded after the last write says it's in sync:
 		// written by handleDownload (from S3) or already uploaded.
 		log.Printf("watcher: skipping %s in %s (already synced to S3)", s3Key, storageID)
@@ -493,18 +516,20 @@ const (
 	localOlder                     // differs, S3 object is newer
 )
 
-// reconcileLocal classifies a metadata-less cached file against its S3 HEAD,
-// using the same rules as --resync.
+// reconcileLocal classifies a metadata-less cached file against its S3 HEAD.
+// Like --resync, the newer side wins, but a same-size file only counts as in
+// sync if it isn't newer than the S3 object: fixed-size files (raw disks,
+// padded ISOs) can change without changing size.
 func reconcileLocal(info os.FileInfo, head *s3client.ObjectInfo, headErr error) localState {
 	switch {
 	case errors.Is(headErr, s3client.ErrNotFound):
 		return localMissing
 	case headErr != nil:
 		return localUnknown
-	case info.Size() == head.Size:
-		return localInSync
 	case info.ModTime().After(head.LastModified):
 		return localNewer
+	case info.Size() == head.Size:
+		return localInSync
 	default:
 		return localOlder
 	}

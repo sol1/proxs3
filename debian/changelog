@@ -20,18 +20,26 @@ proxs3 (0.7.1-1) unstable; urgency=medium
     it is unchanged, so the newer content still goes up, even when it's
     the same size.
   * Cache files with no metadata (written while the daemon was down, or
-    left by older versions) are checked against S3 the same way --resync
-    does, instead of being blindly uploaded. Copy and rename now record
-    metadata for the destination, so clones aren't uploaded a second time.
+    left by older versions) are checked against S3 instead of being
+    blindly uploaded: the newer side wins, so a stale local copy can't
+    overwrite a newer object another node uploaded. Same size only counts
+    as in sync if the local file isn't newer, since raw disks and padded
+    ISOs can change without changing size. --resync uses the same rule.
+  * Copy and rename of a file still pending upload now upload the local
+    content under the new name, instead of copying the stale S3 version.
+    Both record metadata for the destination, so clones aren't uploaded a
+    second time.
+  * Cache metadata records the file's inode, so a file moved in over a
+    synced one is always picked up for upload, even with an old mtime.
   * Delete and rename now stop and wait for any background upload of the
     same file, and hold off new ones until done, so an upload finishing
     late can't bring a deleted object back on S3.
   * Failed background uploads are retried with backoff (1m doubling to
     30m) instead of waiting for a restart.
-  * If a cached file can't be removed, keep its metadata so the leftover
-    isn't mistaken for a new local file and re-uploaded.
-  * Uploads take the ETag from the PUT response instead of a separate
-    HeadObject call.
+  * If a cached file can't be removed, keep its metadata (no longer marked
+    pending) so the leftover isn't re-uploaded.
+  * Uploads and S3 copies take the ETag from the response instead of a
+    separate HeadObject call.
 
  -- Dave Kempe <dave@sol1.com.au>  Sun, 25 Oct 2026 12:00:00 +1100
 

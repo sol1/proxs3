@@ -61,7 +61,8 @@ type S3Client interface {
 	// PutObject returns the ETag S3 assigned to the new object.
 	PutObject(ctx context.Context, key string, body io.Reader, size int64) (string, error)
 	DeleteObject(ctx context.Context, key string) error
-	CopyObject(ctx context.Context, srcKey, dstKey string) error
+	// CopyObject returns the ETag of the new object.
+	CopyObject(ctx context.Context, srcKey, dstKey string) (string, error)
 	GetObjectTagging(ctx context.Context, key string) (map[string]string, error)
 	PutObjectTagging(ctx context.Context, key string, tags map[string]string) error
 	HeadBucket(ctx context.Context) error
@@ -265,16 +266,20 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 }
 
 // CopyObject copies an object within the same bucket.
-func (c *Client) CopyObject(ctx context.Context, srcKey, dstKey string) error {
-	_, err := c.s3.CopyObject(ctx, &s3.CopyObjectInput{
+func (c *Client) CopyObject(ctx context.Context, srcKey, dstKey string) (string, error) {
+	out, err := c.s3.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(c.bucket),
 		CopySource: aws.String(fmt.Sprintf("%s/%s", c.bucket, srcKey)),
 		Key:        aws.String(dstKey),
 	})
 	if err != nil {
-		return fmt.Errorf("copying object %s to %s: %w", srcKey, dstKey, err)
+		return "", fmt.Errorf("copying object %s to %s: %w", srcKey, dstKey, err)
 	}
-	return nil
+	etag := ""
+	if out.CopyObjectResult != nil {
+		etag = aws.ToString(out.CopyObjectResult.ETag)
+	}
+	return etag, nil
 }
 
 // GetObjectTagging returns the tags on an S3 object.

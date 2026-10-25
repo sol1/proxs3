@@ -34,6 +34,7 @@ type mockS3Client struct {
 	putStarted chan string
 	putRelease chan struct{}
 	puts       int
+	copies     int
 }
 
 type mockObject struct {
@@ -181,15 +182,16 @@ func (m *mockS3Client) DeleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
-func (m *mockS3Client) CopyObject(ctx context.Context, srcKey, dstKey string) error {
+func (m *mockS3Client) CopyObject(ctx context.Context, srcKey, dstKey string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.copies++
 	obj, ok := m.objects[srcKey]
 	if !ok {
-		return fmt.Errorf("source key %s not found", srcKey)
+		return "", fmt.Errorf("source key %s not found", srcKey)
 	}
 	m.objects[dstKey] = obj
-	return nil
+	return obj.etag, nil
 }
 
 func (m *mockS3Client) GetObjectTagging(ctx context.Context, key string) (map[string]string, error) {
@@ -224,6 +226,7 @@ func newTestServer(t *testing.T, mock *mockS3Client) *Server {
 		uploads:        make(map[string]*uploadState),
 		blocked:        make(map[string]int),
 		retries:        make(map[string]int),
+		retryTimers:    make(map[string]*time.Timer),
 		retryBase:      time.Hour, // tests trigger retries explicitly
 		uploadRequests: make(chan string, 1024),
 	}
@@ -1072,7 +1075,8 @@ func TestHandleResync_SkipsInSync(t *testing.T) {
 		data: "hello", size: 5, etag: "\"x\"", lastModified: time.Now(),
 	}
 	s := newTestServer(t, mock)
-	writeCacheFile(t, s, "s3test", "template/iso/a.iso", "hello", time.Now())
+	// Uploaded from this cache earlier: the local write predates the S3 object.
+	writeCacheFile(t, s, "s3test", "template/iso/a.iso", "hello", time.Now().Add(-time.Hour))
 
 	req := httptest.NewRequest("GET", "/v1/resync?storage=s3test", nil)
 	w := httptest.NewRecorder()
@@ -1292,5 +1296,23 @@ func TestHandleDownload_MetalessInSyncBackfillsMeta(t *testing.T) {
 	case got := <-s.uploadRequests:
 		t.Errorf("unexpected upload request for in-sync file: %s", got)
 	default:
+	}
+}
+
+func TestHandleResync_SameSizeLocalNewer_Uploads(t *testing.T) {
+	mock := newMockClient("s3test")
+	// Fixed-size file changed locally after the S3 copy was made.
+	mock.objects["images/100/vm-100-disk-0.raw"] = mockObject{
+		data: "AAAA", size: 4, etag: "\"a\"", lastModified: time.Now().Add(-time.Hour),
+	}
+	s := newTestServer(t, mock)
+	writeCacheFile(t, s, "s3test", "images/100/vm-100-disk-0.raw", "BBBB", time.Now())
+
+	req := httptest.NewRequest("GET", "/v1/resync?storage=s3test", nil)
+	w := httptest.NewRecorder()
+	s.handleResync(w, req)
+
+	if obj, _ := mock.object("images/100/vm-100-disk-0.raw"); obj.data != "BBBB" {
+		t.Errorf("expected locally modified same-size file uploaded, S3 has %q\n%s", obj.data, w.Body.String())
 	}
 }

@@ -98,8 +98,10 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 		case headErr != nil:
 			shouldUpload = true
 			reason = "missing in S3"
-		case info.Size() == head.Size:
-			// Sizes match — assume in sync. Backfill metadata so the
+		case info.Size() == head.Size && (s.cache.GetMeta(storageID, s3Key).Covers(info) ||
+			!info.ModTime().After(head.LastModified)):
+			// Sizes match and local isn't newer (or our metadata says it's
+			// what we synced) — assume in sync. Backfill metadata so the
 			// watcher's same-size short-circuit works on future events.
 			if s.cache.GetMeta(storageID, s3Key) == nil {
 				s.cache.StoreMeta(storageID, s3Key, cache.FileMeta{
@@ -111,7 +113,7 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 			return nil
 		case info.ModTime().After(head.LastModified):
 			shouldUpload = true
-			reason = fmt.Sprintf("size mismatch, local newer (local=%d s3=%d)", info.Size(), head.Size)
+			reason = fmt.Sprintf("local newer (local=%d s3=%d)", info.Size(), head.Size)
 			emit("WARNING: %s — %s — uploading local copy", s3Key, reason)
 			log.Printf("resync warning: %s/%s — %s — uploading local copy", storageID, s3Key, reason)
 		case force:
@@ -131,9 +133,16 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
+		started := time.Now()
 		f, err := os.Open(path)
 		if err != nil {
 			emit("error opening %s: %v", path, err)
+			errs++
+			return nil
+		}
+		if info, err = f.Stat(); err != nil {
+			f.Close()
+			emit("error stating %s: %v", path, err)
 			errs++
 			return nil
 		}
@@ -154,11 +163,16 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 
 		// Record the ETag S3 assigned so the staleness check recognizes the
 		// cached copy as current instead of re-downloading it on first access.
-		s.cache.StoreMeta(storageID, s3Key, cache.FileMeta{
+		// Only if unchanged since the upload, like the watcher: a rewrite
+		// mid-upload stays pending so the newer content still goes up.
+		if !s.cache.MarkSynced(storageID, s3Key, info, started, cache.FileMeta{
 			ETag:         etag,
 			LastModified: time.Now(),
 			Size:         size,
-		})
+		}) {
+			s.cache.MarkPending(storageID, s3Key)
+			emit("note: %s changed during upload, left pending for the watcher", s3Key)
+		}
 		uploaded++
 		return nil
 	})

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -36,6 +37,27 @@ type FileMeta struct {
 	// value means "in sync with S3", so metadata written by older versions
 	// keeps its meaning.
 	PendingUpload bool `json:"pending_upload,omitempty"`
+	// Inode of the content file when the metadata was written, so a file
+	// replaced by rename (which can carry an old mtime) isn't mistaken for
+	// the one the metadata describes. Zero for metadata from older versions.
+	Inode uint64 `json:"inode,omitempty"`
+}
+
+// Covers reports whether in-sync metadata describes the file's current
+// state: recorded after its last modification, same size, same inode. If
+// so, any write to the file was the daemon's own (download, upload link,
+// copy, rename) and there is nothing to upload.
+func (m *FileMeta) Covers(info os.FileInfo) bool {
+	return m != nil && !m.PendingUpload &&
+		m.Size == info.Size() && !info.ModTime().After(m.CachedAt) &&
+		(m.Inode == 0 || m.Inode == inodeOf(info))
+}
+
+func inodeOf(info os.FileInfo) uint64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
 }
 
 // FileCache provides a local filesystem cache for S3 objects.
@@ -90,6 +112,10 @@ func (fc *FileCache) StoreMeta(storageID, key string, meta FileMeta) {
 // uses to tell the daemon's own writes from PVE's.
 func (fc *FileCache) writeMeta(storageID, key string, meta FileMeta) {
 	meta.CachedAt = time.Now()
+	meta.Inode = 0
+	if info, err := os.Stat(fc.path(storageID, key)); err == nil {
+		meta.Inode = inodeOf(info)
+	}
 	mp := fc.metaPath(storageID, key)
 	if err := os.MkdirAll(filepath.Dir(mp), 0755); err != nil {
 		return
@@ -113,8 +139,7 @@ func (fc *FileCache) MarkPending(storageID, key string) bool {
 	if err != nil || info.IsDir() {
 		return false
 	}
-	if meta := fc.getMeta(storageID, key); meta != nil && !meta.PendingUpload &&
-		meta.Size == info.Size() && !info.ModTime().After(meta.CachedAt) {
+	if fc.getMeta(storageID, key).Covers(info) {
 		return false
 	}
 	fc.writeMeta(storageID, key, FileMeta{
@@ -130,7 +155,8 @@ func (fc *FileCache) MarkPending(storageID, key string) bool {
 // inode, size and mtime, and not marked pending again since started. If it
 // changed, the pending state is left alone so the newer content still gets
 // uploaded. Atomic with MarkPending, so a rewrite can't slip in between the
-// check and the write.
+// check and the write. A zero started skips the pending check, for files
+// the daemon itself just created (the watcher may already have marked them).
 func (fc *FileCache) MarkSynced(storageID, key string, uploaded os.FileInfo, started time.Time, meta FileMeta) bool {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
@@ -139,7 +165,7 @@ func (fc *FileCache) MarkSynced(storageID, key string, uploaded os.FileInfo, sta
 		info.Size() != uploaded.Size() || !info.ModTime().Equal(uploaded.ModTime()) {
 		return false
 	}
-	if cur := fc.getMeta(storageID, key); cur != nil && cur.PendingUpload && cur.CachedAt.After(started) {
+	if cur := fc.getMeta(storageID, key); !started.IsZero() && cur != nil && cur.PendingUpload && cur.CachedAt.After(started) {
 		return false // a write was seen after we started, even if mtime didn't tick
 	}
 	fc.writeMeta(storageID, key, meta)
@@ -284,8 +310,12 @@ func (fc *FileCache) Remove(storageID, key string) error {
 		err = os.Remove(p)
 	}
 	if err != nil && !os.IsNotExist(err) {
-		// Keep the metadata: a content file without it would look like a
-		// pending PVE write and get re-uploaded, resurrecting the object.
+		// Keep metadata, and clear any pending flag: the leftover must not
+		// look like a PVE write and get re-uploaded, resurrecting the object.
+		if meta := fc.getMeta(storageID, key); meta != nil && meta.PendingUpload {
+			meta.PendingUpload = false
+			fc.writeMeta(storageID, key, *meta)
+		}
 		log.Printf("cache: failed to remove %s: %v", p, err)
 		return err
 	}

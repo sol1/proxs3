@@ -433,3 +433,72 @@ func TestHandleRename_CancelsInFlightSourceUpload(t *testing.T) {
 		t.Error("watcher would treat the renamed file as a new PVE write")
 	}
 }
+
+func TestUploadNewFile_MetalessSameSizeLocalNewerUploaded(t *testing.T) {
+	mock := newMockClient("s3test")
+	key := "images/100/vm-100-disk-0.raw"
+	mock.objects[key] = mockObject{data: "AAAA", size: 4, etag: "\"a\"", lastModified: time.Now().Add(-time.Hour)}
+	s := newTestServer(t, mock)
+	p := writeMetalessFile(t, s, key, "BBBB") // modified while the daemon was down
+
+	s.uploadNewFile(p)
+
+	if obj, _ := mock.object(key); obj.data != "BBBB" {
+		t.Errorf("expected same-size local change uploaded, S3 has %q", obj.data)
+	}
+}
+
+func TestHandleRename_PendingSourceUploadsLocalNotStaleS3(t *testing.T) {
+	mock := newMockClient("s3test")
+	src := "images/100/vm-100-disk-0.raw"
+	dst := "images/100/base-100-disk-0.raw"
+	// S3 has an old version of src; PVE has since rewritten it locally.
+	mock.objects[src] = mockObject{data: "OLD!", size: 4, etag: "\"o\"", lastModified: time.Now().Add(-time.Hour)}
+	s := newTestServer(t, mock)
+	p := writeMetalessFile(t, s, src, "NEW!")
+	s.markPendingUpload(p)
+
+	req := httptest.NewRequest("POST", "/v1/rename?storage=s3test&src_key="+src+"&dst_key="+dst, nil)
+	w := httptest.NewRecorder()
+	s.handleRename(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if obj, _ := mock.object(dst); obj.data != "NEW!" {
+		t.Errorf("expected renamed object to carry local content, got %q", obj.data)
+	}
+	if _, ok := mock.object(src); ok {
+		t.Error("expected old source removed from S3")
+	}
+	meta := s.cache.GetMeta("s3test", dst)
+	if meta == nil || meta.PendingUpload || meta.ETag == "" {
+		t.Errorf("expected synced meta on renamed file, got %+v", meta)
+	}
+}
+
+func TestHandleCopy_NoSecondUploadAfterWatcherMark(t *testing.T) {
+	mock := newMockClient("s3test")
+	src := "images/9001/base-9001-disk-0.raw"
+	dst := "images/100/vm-100-disk-0.raw"
+	mock.objects[src] = mockObject{data: "disk", size: 4, etag: "\"d\"", lastModified: time.Now()}
+	s := newTestServer(t, mock)
+	srcPath := writeMetalessFile(t, s, src, "disk")
+	s.cache.StoreMeta("s3test", src, cache.FileMeta{ETag: "\"d\"", Size: 4})
+	_ = srcPath
+
+	req := httptest.NewRequest("POST", "/v1/copy?storage=s3test&src_key="+src+"&dst_key="+dst, nil)
+	w := httptest.NewRecorder()
+	s.handleCopy(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// The watcher's Create event for dst arrives late, then its debounce fires.
+	dstPath := s.cache.ExpectedPath("s3test", dst)
+	s.markPendingUpload(dstPath)
+	s.uploadNewFile(dstPath)
+	if n := mock.putCount(); n != 0 {
+		t.Errorf("expected no upload of the copy destination, got %d", n)
+	}
+}
