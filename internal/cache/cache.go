@@ -82,7 +82,13 @@ func (fc *FileCache) Path(storageID, key string) string {
 func (fc *FileCache) StoreMeta(storageID, key string, meta FileMeta) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
+	fc.writeMeta(storageID, key, meta)
+}
 
+// writeMeta stamps CachedAt and writes the metadata file. Caller holds fc.mu.
+// CachedAt doubles as the "recorded after the last write" marker MarkPending
+// uses to tell the daemon's own writes from PVE's.
+func (fc *FileCache) writeMeta(storageID, key string, meta FileMeta) {
 	meta.CachedAt = time.Now()
 	mp := fc.metaPath(storageID, key)
 	if err := os.MkdirAll(filepath.Dir(mp), 0755); err != nil {
@@ -95,11 +101,60 @@ func (fc *FileCache) StoreMeta(storageID, key string, meta FileMeta) {
 	os.WriteFile(mp, data, 0644)
 }
 
+// MarkPending records that the local file was written outside the daemon (by
+// PVE) and is now authoritative until uploaded. Returns false, changing
+// nothing, if the file is gone or its current state is already covered by
+// in-sync metadata recorded after its last modification — i.e. the write was
+// the daemon's own (download, upload link, copy, rename).
+func (fc *FileCache) MarkPending(storageID, key string) bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	info, err := os.Stat(fc.path(storageID, key))
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if meta := fc.getMeta(storageID, key); meta != nil && !meta.PendingUpload &&
+		meta.Size == info.Size() && !info.ModTime().After(meta.CachedAt) {
+		return false
+	}
+	fc.writeMeta(storageID, key, FileMeta{
+		Size:          info.Size(),
+		LastModified:  info.ModTime(),
+		PendingUpload: true,
+	})
+	return true
+}
+
+// MarkSynced records meta for a file that was just uploaded (or found to
+// match S3), but only if the file is still exactly what was uploaded: same
+// inode, size and mtime, and not marked pending again since started. If it
+// changed, the pending state is left alone so the newer content still gets
+// uploaded. Atomic with MarkPending, so a rewrite can't slip in between the
+// check and the write.
+func (fc *FileCache) MarkSynced(storageID, key string, uploaded os.FileInfo, started time.Time, meta FileMeta) bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	info, err := os.Stat(fc.path(storageID, key))
+	if err != nil || !os.SameFile(info, uploaded) ||
+		info.Size() != uploaded.Size() || !info.ModTime().Equal(uploaded.ModTime()) {
+		return false
+	}
+	if cur := fc.getMeta(storageID, key); cur != nil && cur.PendingUpload && cur.CachedAt.After(started) {
+		return false // a write was seen after we started, even if mtime didn't tick
+	}
+	fc.writeMeta(storageID, key, meta)
+	return true
+}
+
 // GetMeta returns the stored metadata for a cached object, or nil if not cached.
 func (fc *FileCache) GetMeta(storageID, key string) *FileMeta {
 	fc.mu.RLock()
 	defer fc.mu.RUnlock()
+	return fc.getMeta(storageID, key)
+}
 
+// getMeta reads metadata. Caller holds fc.mu (read or write).
+func (fc *FileCache) getMeta(storageID, key string) *FileMeta {
 	mp := fc.metaPath(storageID, key)
 	data, err := os.ReadFile(mp)
 	if err != nil {
@@ -136,7 +191,9 @@ func (fc *FileCache) Invalidate(storageID, key string) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	p := fc.path(storageID, key)
-	os.Remove(p)
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return // keep meta: a file without it would look like a pending PVE write
+	}
 	os.Remove(fc.metaPath(storageID, key))
 	os.Remove(p + ".meta") // clean up legacy location
 }
@@ -162,12 +219,8 @@ func (fc *FileCache) Store(storageID, key string, r io.Reader, meta FileMeta) (s
 		return "", fmt.Errorf("writing cache file: %w", err)
 	}
 
-	// Write metadata to .meta/ subdirectory
-	meta.CachedAt = time.Now()
-	metaData, _ := json.Marshal(meta)
-	mp := fc.metaPath(storageID, key)
-	os.MkdirAll(filepath.Dir(mp), 0755)
-	os.WriteFile(mp, metaData, 0644)
+	f.Close() // flush before meta so CachedAt is after the last write
+	fc.writeMeta(storageID, key, meta)
 
 	// Evict if over limit (async, best-effort)
 	go fc.evictIfNeeded()
@@ -213,12 +266,7 @@ func (fc *FileCache) Link(storageID, key, srcPath string, meta FileMeta) {
 		}
 	}
 
-	// Write metadata to .meta/ subdirectory
-	meta.CachedAt = time.Now()
-	metaData, _ := json.Marshal(meta)
-	mp := fc.metaPath(storageID, key)
-	os.MkdirAll(filepath.Dir(mp), 0755)
-	os.WriteFile(mp, metaData, 0644)
+	fc.writeMeta(storageID, key, meta)
 }
 
 // Remove deletes a cached file and its metadata.
@@ -227,8 +275,6 @@ func (fc *FileCache) Remove(storageID, key string) error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	p := fc.path(storageID, key)
-	os.Remove(fc.metaPath(storageID, key))
-	os.Remove(p + ".meta") // clean up legacy location
 	clearImmutable(p)
 	err := os.Remove(p)
 	if err != nil && !os.IsNotExist(err) {
@@ -238,8 +284,13 @@ func (fc *FileCache) Remove(storageID, key string) error {
 		err = os.Remove(p)
 	}
 	if err != nil && !os.IsNotExist(err) {
+		// Keep the metadata: a content file without it would look like a
+		// pending PVE write and get re-uploaded, resurrecting the object.
 		log.Printf("cache: failed to remove %s: %v", p, err)
+		return err
 	}
+	os.Remove(fc.metaPath(storageID, key))
+	os.Remove(p + ".meta") // clean up legacy location
 	return err
 }
 

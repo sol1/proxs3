@@ -58,7 +58,8 @@ type S3Client interface {
 	HeadObject(ctx context.Context, key string) (*ObjectInfo, error)
 	GetObject(ctx context.Context, key string) (*GetObjectResult, error)
 	DownloadToFile(ctx context.Context, key string, w io.WriterAt) (int64, error)
-	PutObject(ctx context.Context, key string, body io.Reader, size int64) error
+	// PutObject returns the ETag S3 assigned to the new object.
+	PutObject(ctx context.Context, key string, body io.Reader, size int64) (string, error)
 	DeleteObject(ctx context.Context, key string) error
 	CopyObject(ctx context.Context, srcKey, dstKey string) error
 	GetObjectTagging(ctx context.Context, key string) (map[string]string, error)
@@ -233,22 +234,22 @@ func (c *Client) DownloadToFile(ctx context.Context, key string, w io.WriterAt) 
 	return n, nil
 }
 
-// PutObject uploads an object from a reader.
+// PutObject uploads an object from a reader and returns its ETag.
 // Uses multipart upload with part size configured via PartSizeMB (default 64MB).
-func (c *Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
+func (c *Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) (string, error) {
 	uploader := manager.NewUploader(c.s3, func(u *manager.Uploader) {
 		u.PartSize = c.partSizeMB * 1024 * 1024
 		u.Concurrency = 4
 	})
-	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+	out, err := uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 		Body:   body,
 	})
 	if err != nil {
-		return fmt.Errorf("putting object %s: %w", key, err)
+		return "", fmt.Errorf("putting object %s: %w", key, err)
 	}
-	return nil
+	return aws.ToString(out.ETag), nil
 }
 
 // DeleteObject removes an object from the bucket.

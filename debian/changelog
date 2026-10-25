@@ -7,6 +7,31 @@ proxs3 (0.7.1-1) unstable; urgency=medium
     volume_snapshot_info (we have no resize or snapshots), and v16's new
     format helpers are only used by the base alloc_image/rename_volume,
     which we override.
+  * Fix /v1/download deleting locally created files that hadn't been
+    uploaded to S3 yet (issue #14, PR #15, thanks Leonorus). A HeadObject
+    404 was taken as "deleted on S3", so a file PVE had just written (like
+    a cloud-init user-data ISO attached straight away) was purged and lost.
+    Files PVE writes into the cache are now marked pending upload, and
+    while pending the local copy is served and queued for upload instead of
+    purged or overwritten from S3. Pending files survive restarts and are
+    never evicted until uploaded.
+  * Don't lose a rewrite that lands while the previous version is
+    uploading. The finished upload no longer marks the file synced unless
+    it is unchanged, so the newer content still goes up, even when it's
+    the same size.
+  * Cache files with no metadata (written while the daemon was down, or
+    left by older versions) are checked against S3 the same way --resync
+    does, instead of being blindly uploaded. Copy and rename now record
+    metadata for the destination, so clones aren't uploaded a second time.
+  * Delete and rename now stop and wait for any background upload of the
+    same file, and hold off new ones until done, so an upload finishing
+    late can't bring a deleted object back on S3.
+  * Failed background uploads are retried with backoff (1m doubling to
+    30m) instead of waiting for a restart.
+  * If a cached file can't be removed, keep its metadata so the leftover
+    isn't mistaken for a new local file and re-uploaded.
+  * Uploads take the ETag from the PUT response instead of a separate
+    HeadObject call.
 
  -- Dave Kempe <dave@sol1.com.au>  Sun, 25 Oct 2026 12:00:00 +1100
 
@@ -28,22 +53,6 @@ proxs3 (0.7.0-1) unstable; urgency=medium
     multi-GB backups loop forever (download -> evict -> retry). Files
     modified within the last 30 minutes are now exempt from size-based
     eviction; a warning is logged when the cache stays over budget.
-  * Fix /v1/download destroying locally created files not yet uploaded to
-    S3: a HeadObject 404 was treated as "deleted on S3" and purged the
-    cached file even when it had never been uploaded (e.g. cloud-init
-    user-data ISOs written by PVE and attached immediately, inside the
-    watcher's debounce window), losing the file permanently. Files are now
-    explicitly tracked as pending upload: the watcher writes a durable
-    pending-upload marker when it detects a local write, and while a file
-    is pending (or has no metadata at all) download serves the local copy
-    and queues the upload instead of purging it or overwriting it with a
-    stale S3 version of the same key. Files confirmed synced still fail
-    closed on 404. Pending files survive restarts (the watcher scans the
-    cache for unconfirmed files on startup) and are exempt from cache
-    eviction until uploaded. An upload trigger arriving mid-transfer now
-    reruns the upload instead of being dropped, delete aborts any in-flight
-    upload of the same file so it can't resurrect the object, and uploads
-    record the S3 ETag so the next download doesn't needlessly re-fetch.
   * Fix PVE restore "connection error timeout" in the UI: path() no longer
     triggers a synchronous download from the API thread for content types
     where activate_volume is called (backup, iso, vztmpl, images). PVE's

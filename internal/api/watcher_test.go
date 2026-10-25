@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -196,8 +197,11 @@ func TestUploadNewFile_RerunAfterTriggerDuringUpload(t *testing.T) {
 	}()
 	<-mock.putStarted // first upload is in flight
 
-	// The file is rewritten mid-upload; this trigger must not be dropped.
-	os.WriteFile(localPath, []byte("v2-longer"), 0644)
+	// The file is rewritten mid-upload, at the same size (cloud-init ISOs
+	// often are). The watcher marks it pending and triggers again; neither
+	// the rerun nor the new content may be dropped.
+	os.WriteFile(localPath, []byte("v2"), 0644)
+	s.markPendingUpload(localPath)
 	s.uploadNewFile(localPath) // returns immediately, schedules a rerun
 
 	close(mock.putRelease)
@@ -216,7 +220,7 @@ func TestUploadNewFile_RerunAfterTriggerDuringUpload(t *testing.T) {
 	if !ok {
 		t.Fatal("expected object on S3 after rerun")
 	}
-	if obj.data != "v2-longer" {
+	if obj.data != "v2" {
 		t.Errorf("expected rerun to upload rewritten content, got %q", obj.data)
 	}
 }
@@ -260,5 +264,172 @@ func TestHandleDelete_CancelsInFlightUpload(t *testing.T) {
 	}
 	if meta := s.cache.GetMeta("s3test", key); meta != nil {
 		t.Errorf("expected no metadata after delete, got %+v", meta)
+	}
+}
+
+// writeMetalessFile creates a cache file for key with no metadata.
+func writeMetalessFile(t *testing.T, s *Server, key, data string) string {
+	t.Helper()
+	p := s.cache.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	if err := os.WriteFile(p, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestUploadNewFile_MetalessInSyncAdoptsWithoutUpload(t *testing.T) {
+	mock := newMockClient("s3test")
+	key := "images/100/vm-100-disk-0.raw"
+	mock.objects[key] = mockObject{data: "disk", size: 4, etag: "\"d\"", lastModified: time.Now()}
+	s := newTestServer(t, mock)
+	p := writeMetalessFile(t, s, key, "disk") // e.g. clone dst left by 0.7.0
+
+	s.uploadNewFile(p)
+
+	if n := mock.putCount(); n != 0 {
+		t.Errorf("expected no upload for a file already on S3, got %d", n)
+	}
+	if meta := s.cache.GetMeta("s3test", key); meta == nil || meta.PendingUpload || meta.ETag != "\"d\"" {
+		t.Errorf("expected synced meta with S3 ETag, got %+v", meta)
+	}
+}
+
+func TestUploadNewFile_MetalessOlderThanS3NotUploaded(t *testing.T) {
+	mock := newMockClient("s3test")
+	key := "snippets/user.yaml"
+	s := newTestServer(t, mock)
+	p := writeMetalessFile(t, s, key, "old")
+	os.Chtimes(p, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+	// Another node uploaded a newer version since.
+	mock.objects[key] = mockObject{data: "newer", size: 5, etag: "\"n\"", lastModified: time.Now()}
+
+	s.uploadNewFile(p)
+
+	if obj, _ := mock.object(key); obj.data != "newer" {
+		t.Fatalf("stale local copy overwrote newer S3 object: %q", obj.data)
+	}
+	// Recorded without an ETag so the next download re-fetches it.
+	meta := s.cache.GetMeta("s3test", key)
+	if meta == nil || meta.PendingUpload || meta.ETag != "" {
+		t.Errorf("expected ETag-less synced meta, got %+v", meta)
+	}
+}
+
+func TestUploadNewFile_MetalessMissingOnS3Uploaded(t *testing.T) {
+	mock := newMockClient("s3test")
+	s := newTestServer(t, mock)
+	key := "snippets/user.yaml"
+	p := writeMetalessFile(t, s, key, "local")
+
+	s.uploadNewFile(p)
+
+	if obj, ok := mock.object(key); !ok || obj.data != "local" {
+		t.Fatalf("expected local-only file uploaded, got %+v", obj)
+	}
+	if meta := s.cache.GetMeta("s3test", key); meta == nil || meta.PendingUpload || meta.ETag == "" {
+		t.Errorf("expected synced meta with ETag, got %+v", meta)
+	}
+}
+
+func TestUploadNewFile_RetriesFailedUpload(t *testing.T) {
+	mock := newMockClient("s3test")
+	mock.putErr = fmt.Errorf("connection reset")
+	s := newTestServer(t, mock)
+	s.retryBase = 10 * time.Millisecond
+	key := "snippets/user.yaml"
+	p := writeMetalessFile(t, s, key, "data")
+	s.markPendingUpload(p)
+
+	s.uploadNewFile(p)
+
+	select {
+	case got := <-s.uploadRequests:
+		if got != p {
+			t.Fatalf("expected retry for %s, got %s", p, got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed upload was not retried")
+	}
+
+	mock.mu.Lock()
+	mock.putErr = nil
+	mock.mu.Unlock()
+	s.uploadNewFile(p)
+	if _, ok := mock.object(key); !ok {
+		t.Fatal("expected retry to upload")
+	}
+	s.uploadsMu.Lock()
+	defer s.uploadsMu.Unlock()
+	if n := s.retries[p]; n != 0 {
+		t.Errorf("expected retry counter cleared after success, got %d", n)
+	}
+}
+
+func TestBlockUploads_DefersNewUploads(t *testing.T) {
+	mock := newMockClient("s3test")
+	s := newTestServer(t, mock)
+	key := "snippets/user.yaml"
+	p := writeMetalessFile(t, s, key, "data")
+	s.markPendingUpload(p)
+
+	unblock := s.blockUploads(p)
+	if !s.uploadBlocked(p) {
+		t.Fatal("expected path blocked")
+	}
+	s.uploadNewFile(p) // e.g. debounce fired during a delete
+	if n := mock.putCount(); n != 0 {
+		t.Fatalf("expected no upload while blocked, got %d", n)
+	}
+	unblock()
+
+	// File recreated rather than deleted: it must still upload afterwards.
+	s.uploadNewFile(p)
+	if _, ok := mock.object(key); !ok {
+		t.Fatal("expected upload after unblocking")
+	}
+}
+
+func TestHandleRename_CancelsInFlightSourceUpload(t *testing.T) {
+	mock := newMockClient("s3test")
+	mock.putStarted = make(chan string, 2)
+	mock.putRelease = make(chan struct{})
+	s := newTestServer(t, mock)
+	src := "images/100/vm-100-disk-0.raw"
+	dst := "images/100/base-100-disk-0.raw"
+	p := writeMetalessFile(t, s, src, "disk")
+	s.markPendingUpload(p)
+
+	done := make(chan struct{})
+	go func() {
+		s.uploadNewFile(p)
+		close(done)
+	}()
+	<-mock.putStarted // src upload in flight
+
+	go func() {
+		<-mock.putStarted // rename's fallback upload of dst
+		close(mock.putRelease)
+	}()
+	req := httptest.NewRequest("POST", "/v1/rename?storage=s3test&src_key="+src+"&dst_key="+dst, nil)
+	w := httptest.NewRecorder()
+	s.handleRename(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200 from rename, got %d: %s", w.Code, w.Body.String())
+	}
+	<-done
+
+	if _, ok := mock.object(src); ok {
+		t.Error("source key resurrected on S3 by in-flight upload")
+	}
+	if _, ok := mock.object(dst); !ok {
+		t.Error("expected destination on S3")
+	}
+	meta := s.cache.GetMeta("s3test", dst)
+	if meta == nil || meta.PendingUpload || meta.ETag == "" {
+		t.Errorf("expected synced meta on renamed file, got %+v", meta)
+	}
+	if s.markPendingUpload(s.cache.ExpectedPath("s3test", dst)) {
+		t.Error("watcher would treat the renamed file as a new PVE write")
 	}
 }

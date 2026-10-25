@@ -33,6 +33,7 @@ type mockS3Client struct {
 	// set), then blocks until putRelease is closed or the context is canceled.
 	putStarted chan string
 	putRelease chan struct{}
+	puts       int
 }
 
 type mockObject struct {
@@ -94,7 +95,7 @@ func (m *mockS3Client) HeadObject(ctx context.Context, key string) (*s3client.Ob
 	}
 	obj, ok := m.object(key)
 	if !ok {
-		return nil, fmt.Errorf("not found: %s", key)
+		return nil, fmt.Errorf("not found: %s: %w", key, s3client.ErrNotFound)
 	}
 	return &s3client.ObjectInfo{
 		Key:          key,
@@ -132,9 +133,13 @@ func (m *mockS3Client) DownloadToFile(ctx context.Context, key string, w io.Writ
 	return int64(n), err
 }
 
-func (m *mockS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
-	if m.putErr != nil {
-		return m.putErr
+func (m *mockS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) (string, error) {
+	m.mu.Lock()
+	m.puts++
+	putErr := m.putErr
+	m.mu.Unlock()
+	if putErr != nil {
+		return "", putErr
 	}
 	if m.putStarted != nil {
 		m.putStarted <- key
@@ -143,19 +148,27 @@ func (m *mockS3Client) PutObject(ctx context.Context, key string, body io.Reader
 		select {
 		case <-m.putRelease:
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 	}
 	data, _ := io.ReadAll(body)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	etag := fmt.Sprintf("\"%x-%d\"", data, len(data))
 	m.objects[key] = mockObject{
 		data:         string(data),
 		size:         size,
-		etag:         fmt.Sprintf("\"%x\"", len(data)),
+		etag:         etag,
 		lastModified: time.Now(),
 	}
-	return nil
+	return etag, nil
+}
+
+// putCount returns how many PutObject calls were made.
+func (m *mockS3Client) putCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.puts
 }
 
 func (m *mockS3Client) DeleteObject(ctx context.Context, key string) error {
@@ -209,6 +222,9 @@ func newTestServer(t *testing.T, mock *mockS3Client) *Server {
 		health:         map[string]bool{mock.id: mock.healthy},
 		usage:          map[string]int64{mock.id: 0},
 		uploads:        make(map[string]*uploadState),
+		blocked:        make(map[string]int),
+		retries:        make(map[string]int),
+		retryBase:      time.Hour, // tests trigger retries explicitly
 		uploadRequests: make(chan string, 1024),
 	}
 	return s
@@ -785,6 +801,7 @@ func TestHandleDownload_ObjectDeletedOnS3_WatcherUploadedMeta_RemovesCache(t *te
 
 func TestHandleDownload_S3Unreachable_NoCache(t *testing.T) {
 	mock := newMockClient("s3test")
+	mock.headErr = fmt.Errorf("connection refused")
 	mock.getErr = fmt.Errorf("connection refused")
 	s := newTestServer(t, mock)
 
@@ -818,8 +835,8 @@ func TestHandleDownload_ObjectNotFound(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.handleDownload(w, req)
 
-	if w.Code != 500 {
-		t.Errorf("expected 500 for missing object, got %d", w.Code)
+	if w.Code != 404 {
+		t.Errorf("expected 404 for missing object, got %d", w.Code)
 	}
 }
 
@@ -1202,5 +1219,78 @@ func TestCheckAllHealth_Unhealthy(t *testing.T) {
 
 	if online {
 		t.Error("expected online=false")
+	}
+}
+
+func TestHandleCopy_DestinationRecordedAsSynced(t *testing.T) {
+	mock := newMockClient("s3test")
+	src := "images/9001/base-9001-disk-0.raw"
+	dst := "images/100/vm-100-disk-0.raw"
+	mock.objects[src] = mockObject{data: "disk", size: 4, etag: "\"d\"", lastModified: time.Now()}
+	s := newTestServer(t, mock)
+	srcPath := s.cache.ExpectedPath("s3test", src)
+	os.MkdirAll(filepath.Dir(srcPath), 0755)
+	os.WriteFile(srcPath, []byte("disk"), 0644)
+	s.cache.StoreMeta("s3test", src, cache.FileMeta{ETag: "\"d\"", Size: 4})
+
+	req := httptest.NewRequest("POST", "/v1/copy?storage=s3test&src_key="+src+"&dst_key="+dst, nil)
+	w := httptest.NewRecorder()
+	s.handleCopy(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	meta := s.cache.GetMeta("s3test", dst)
+	if meta == nil || meta.PendingUpload || meta.ETag != "\"d\"" {
+		t.Fatalf("expected synced meta on copy destination, got %+v", meta)
+	}
+	if s.markPendingUpload(s.cache.ExpectedPath("s3test", dst)) {
+		t.Error("watcher would re-upload the copy destination")
+	}
+}
+
+func TestHandleDownload_MetalessOlderThanS3Redownloads(t *testing.T) {
+	mock := newMockClient("s3test")
+	key := "template/iso/test.iso"
+	s := newTestServer(t, mock)
+	p := s.cache.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("old"), 0644)
+	os.Chtimes(p, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+	mock.objects[key] = mockObject{data: "newer", size: 5, etag: "\"n\"", lastModified: time.Now()}
+
+	req := httptest.NewRequest("GET", "/v1/download?storage=s3test&key="+key, nil)
+	w := httptest.NewRecorder()
+	s.handleDownload(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if data, _ := os.ReadFile(p); string(data) != "newer" {
+		t.Errorf("expected newer S3 copy downloaded, got %q", data)
+	}
+}
+
+func TestHandleDownload_MetalessInSyncBackfillsMeta(t *testing.T) {
+	mock := newMockClient("s3test")
+	key := "template/iso/test.iso"
+	mock.objects[key] = mockObject{data: "same", size: 4, etag: "\"s\"", lastModified: time.Now()}
+	s := newTestServer(t, mock)
+	p := s.cache.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("same"), 0644)
+
+	req := httptest.NewRequest("GET", "/v1/download?storage=s3test&key="+key, nil)
+	w := httptest.NewRecorder()
+	s.handleDownload(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if meta := s.cache.GetMeta("s3test", key); meta == nil || meta.ETag != "\"s\"" {
+		t.Errorf("expected backfilled meta, got %+v", meta)
+	}
+	select {
+	case got := <-s.uploadRequests:
+		t.Errorf("unexpected upload request for in-sync file: %s", got)
+	default:
 	}
 }

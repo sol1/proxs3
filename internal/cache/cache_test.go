@@ -794,3 +794,82 @@ func TestEviction_SkipsPendingUpload(t *testing.T) {
 		t.Error("expected synced file to be size-evicted")
 	}
 }
+
+func TestMarkPending_IgnoresOwnWrites(t *testing.T) {
+	fc, _ := New(t.TempDir(), 100)
+	key := "snippets/user.yaml"
+	p := fc.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("v1"), 0644)
+
+	// The daemon wrote the file and then recorded it as synced: its own
+	// write, so the (late) watcher event must not flip it to pending.
+	fc.StoreMeta("s3test", key, FileMeta{ETag: "\"a\"", Size: 2})
+	if fc.MarkPending("s3test", key) {
+		t.Fatal("expected MarkPending to ignore a write covered by newer synced meta")
+	}
+
+	// A later write by PVE is not covered and must be marked.
+	time.Sleep(10 * time.Millisecond) // let the coarse mtime clock tick
+	os.WriteFile(p, []byte("v2"), 0644)
+	if !fc.MarkPending("s3test", key) {
+		t.Fatal("expected MarkPending to mark a write made after the synced meta")
+	}
+	if meta := fc.GetMeta("s3test", key); meta == nil || !meta.PendingUpload {
+		t.Errorf("expected pending meta, got %+v", meta)
+	}
+}
+
+func TestMarkSynced_RefusesChangedFile(t *testing.T) {
+	fc, _ := New(t.TempDir(), 100)
+	key := "snippets/user.yaml"
+	p := fc.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("v1"), 0644)
+	uploaded, _ := os.Stat(p)
+	started := time.Now()
+
+	// Same size rewrite, seen by the watcher during the upload.
+	os.WriteFile(p, []byte("v2"), 0644)
+	fc.MarkPending("s3test", key)
+
+	if fc.MarkSynced("s3test", key, uploaded, started, FileMeta{ETag: "\"v1\"", Size: 2}) {
+		t.Fatal("expected MarkSynced to refuse a file rewritten during upload")
+	}
+	if meta := fc.GetMeta("s3test", key); meta == nil || !meta.PendingUpload {
+		t.Errorf("expected pending meta to survive, got %+v", meta)
+	}
+
+	// Unchanged since the snapshot: accepted.
+	uploaded, _ = os.Stat(p)
+	if !fc.MarkSynced("s3test", key, uploaded, time.Now(), FileMeta{ETag: "\"v2\"", Size: 2}) {
+		t.Fatal("expected MarkSynced to accept an unchanged file")
+	}
+	if meta := fc.GetMeta("s3test", key); meta == nil || meta.PendingUpload || meta.ETag != "\"v2\"" {
+		t.Errorf("expected synced meta, got %+v", meta)
+	}
+}
+
+func TestRemove_KeepsMetaWhenFileRemovalFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	fc, _ := New(t.TempDir(), 100)
+	key := "template/iso/test.iso"
+	p := fc.ExpectedPath("s3test", key)
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte("iso"), 0644)
+	fc.StoreMeta("s3test", key, FileMeta{ETag: "\"e\"", Size: 3})
+
+	os.Chmod(filepath.Dir(p), 0555) // file can't be unlinked
+	defer os.Chmod(filepath.Dir(p), 0755)
+
+	if err := fc.Remove("s3test", key); err == nil {
+		t.Fatal("expected Remove to fail")
+	}
+	// Without meta the leftover would look like a pending PVE write and be
+	// re-uploaded, resurrecting the deleted object.
+	if meta := fc.GetMeta("s3test", key); meta == nil || meta.PendingUpload {
+		t.Errorf("expected synced meta kept, got %+v", meta)
+	}
+}
