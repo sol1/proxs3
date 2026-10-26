@@ -45,7 +45,7 @@ proxs3 (0.7.1-1) unstable; urgency=medium
     in-flight requests weren't given time to drain, and the PID file was
     left behind. It now waits for shutdown to finish and exits 0.
 
- -- Dave Kempe <dave@sol1.com.au>  Sun, 25 Oct 2026 12:00:00 +1100
+ -- Dave Kempe <dave@sol1.com.au>  Mon, 26 Oct 2026 11:28:03 +1100
 
 proxs3 (0.7.0-1) unstable; urgency=medium
 
