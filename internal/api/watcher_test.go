@@ -284,6 +284,8 @@ func TestUploadNewFile_MetalessInSyncAdoptsWithoutUpload(t *testing.T) {
 	mock.objects[key] = mockObject{data: "disk", size: 4, etag: "\"d\"", lastModified: time.Now()}
 	s := newTestServer(t, mock)
 	p := writeMetalessFile(t, s, key, "disk") // e.g. clone dst left by 0.7.0
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(p, old, old)
 
 	s.uploadNewFile(p)
 

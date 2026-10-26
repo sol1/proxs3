@@ -1282,6 +1282,8 @@ func TestHandleDownload_MetalessInSyncBackfillsMeta(t *testing.T) {
 	p := s.cache.ExpectedPath("s3test", key)
 	os.MkdirAll(filepath.Dir(p), 0755)
 	os.WriteFile(p, []byte("same"), 0644)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(p, old, old)
 
 	req := httptest.NewRequest("GET", "/v1/download?storage=s3test&key="+key, nil)
 	w := httptest.NewRecorder()
