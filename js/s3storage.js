@@ -105,3 +105,21 @@ if (typeof PVE !== 'undefined' && PVE.Utils && PVE.Utils.storageSchema) {
 	backups: true,
     };
 }
+
+// PVE 9.3+ lists storage types with a category and description, but only has
+// them for built-in types. Fill ours in so S3 isn't a bare entry under "Other".
+if (typeof Ext !== 'undefined' && Ext.ClassManager.get('PVE.dc.StorageView') &&
+    PVE.dc.StorageView.prototype.addActions) {
+    Ext.override(PVE.dc.StorageView, {
+	addActions: function() {
+	    let actions = this.callParent(arguments);
+	    let s3 = actions.find((action) => action.id === 'type:s3');
+	    if (s3) {
+		s3.category = 'network';
+		s3.description = gettext('Store ISOs, templates, backups and VM disk templates in an S3 bucket, cached on each node.');
+		s3.keywords = 's3 object bucket aws minio garage cloud proxs3';
+	    }
+	    return actions;
+	},
+    });
+}
