@@ -34,8 +34,12 @@ my $_cache_dir;
 #        virtual-size (N/A — we die on resize and have no snapshots)
 #   v16: volname_for_format() and friends, only called from the base
 #        alloc_image/rename_volume (N/A — we override both without calling base)
+#   v17: vm-vol/vm-state/ct-vol volume types (we keep 'images', see
+#        guest_volume_vtype below), UI metadata (our own panel still wins),
+#        isolate-properties (optional, not used), free_image workers and
+#        activate after the config lock (no change needed)
 use constant APIVERSION_MIN => 11;
-use constant APIVERSION_MAX => 16;
+use constant APIVERSION_MAX => 17;
 
 sub api {
     my $apiver = eval { PVE::Storage::APIVER() };
@@ -44,6 +48,13 @@ sub api {
     # Outside our validated range: report our max and let PVE::Storage decide
     # whether that is still acceptable (it dies if we are below APIVER-APIAGE).
     return APIVERSION_MAX;
+}
+
+# From API 17 the inherited parse_volname reports guest disks as vm-vol or
+# vm-state. We only hold VM disk templates and key everything off 'images'
+# (see _parse_volname), which PVE still accepts for any VM volume.
+sub guest_volume_vtype {
+    return 'images';
 }
 
 # Register as storage type 's3'

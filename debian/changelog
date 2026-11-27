@@ -1,3 +1,16 @@
+proxs3 (0.7.2-1) unstable; urgency=medium
+
+  * Raise the validated PVE storage API range to 11..17 for PVE 9.3
+    (libpve-storage-perl 9.1.26 is APIVER 17), which brings back the
+    "older storage API" warning on 0.7.1 (#17). From v17 the inherited
+    parse_volname reports VM disks as vm-vol or vm-state instead of images.
+    We keep returning images, which PVE still accepts for VM volumes and
+    matches how the plugin maps disk templates to S3. The other v17 changes
+    (UI metadata, isolate-properties, free_image workers, activating a new
+    storage after the config lock) need no changes here.
+
+ -- Dave Kempe <dave@sol1.com.au>  Fri, 27 Nov 2026 14:00:49 +1100
+
 proxs3 (0.7.1-1) unstable; urgency=medium
 
   * Raise the validated PVE storage API range to 11..16 (issue #16). PVE 9.2
