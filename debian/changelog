@@ -8,8 +8,16 @@ proxs3 (0.7.2-1) unstable; urgency=medium
     matches how the plugin maps disk templates to S3. The other v17 changes
     (UI metadata, isolate-properties, free_image workers, activating a new
     storage after the config lock) need no changes here.
+  * Describe the storage options for PVE 9.3's generated storage dialog
+    and API: titles, defaults that match the daemon, use-ssl,
+    cache-max-age and part-size-mb as advanced options, and an "S3"
+    display name. Drop rootdir and none from the supported content list,
+    which 9.3 was reporting as supported. Older PVE ignores the new keys.
+  * Show S3 under Network with a description and search keywords in the
+    PVE 9.3 Add Storage list. Our own S3 panel is still used on 9.2 and
+    9.3.
 
- -- Dave Kempe <dave@sol1.com.au>  Fri, 27 Nov 2026 14:00:49 +1100
+ -- Dave Kempe <dave@sol1.com.au>  Fri, 27 Nov 2026 14:11:27 +1100
 
 proxs3 (0.7.1-1) unstable; urgency=medium
 
