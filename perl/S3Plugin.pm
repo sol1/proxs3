@@ -65,7 +65,7 @@ sub type {
 sub plugindata {
     return {
         content => [
-            { images => 1, rootdir => 0, vztmpl => 1, iso => 1, backup => 1, snippets => 1, none => 0, import => 1 },
+            { images => 1, vztmpl => 1, iso => 1, backup => 1, snippets => 1, import => 1 },
             { iso => 1, vztmpl => 1, snippets => 1 },
         ],
         format => [ { raw => 1 } , 'raw' ],
@@ -73,43 +73,63 @@ sub plugindata {
             'access-key' => 1,
             'secret-key' => 1,
         },
+        # API 17: PVE 9.3+ builds the add/edit dialog from these when our own
+        # panel (js/s3storage.js) isn't registered. Older PVE ignores them.
+        'advanced-properties' => {
+            'use-ssl'       => 1,
+            'cache-max-age' => 1,
+            'part-size-mb'  => 1,
+        },
+        meta => { 'display-name' => 'S3' },
     };
 }
 
 sub properties {
     return {
         endpoint => {
+            title       => 'Endpoint',
             description => "S3 endpoint hostname (e.g., s3.amazonaws.com or minio.local:9000)",
             type        => 'string',
         },
         bucket => {
+            title       => 'Bucket',
             description => "S3 bucket name",
             type        => 'string',
         },
         region => {
+            title       => 'Region',
+            default     => 'us-east-1',
             description => "S3 region",
             type        => 'string',
             optional    => 1,
         },
         'access-key' => {
+            title       => 'Access Key',
             description => "S3 access key ID",
             type        => 'string',
         },
         'secret-key' => {
+            title       => 'Secret Key',
             description => "S3 secret access key",
             type        => 'string',
         },
         'use-ssl' => {
+            title       => 'Use SSL',
+            default     => 1,
             description => "Use HTTPS to connect to S3",
             type        => 'boolean',
             optional    => 1,
         },
         'path-style' => {
+            title       => 'Path-Style URLs',
+            default     => 0,
             description => "Use path-style S3 access (required for MinIO and most S3-compatible stores)",
             type        => 'boolean',
             optional    => 1,
         },
         'cache-max-age' => {
+            title       => 'Cache Max Age (days)',
+            default     => 0,
             description => "Maximum age of cached files in days (0 = keep forever, default). "
                          . "Useful for backup storages where local cache should be cleaned up after sync.",
             type        => 'integer',
@@ -117,6 +137,8 @@ sub properties {
             optional    => 1,
         },
         'part-size-mb' => {
+            title       => 'Part Size (MB)',
+            default     => 64,
             description => "Multipart upload part size in MB (default 64). "
                          . "MinIO requires <= 16. Set to 16 for MinIO compatibility.",
             type        => 'integer',
